@@ -228,6 +228,96 @@ def _check_config() -> Dict:
     }
 
 
+def _list_gr_from_fields() -> Dict:
+    if not GR_API_KEY:
+        return {"error": "GR_API_KEY env var not configured on Railway"}
+    try:
+        with httpx.Client(timeout=30) as c:
+            r = c.get(f"{GR_BASE}/from-fields", headers=gr_headers())
+            r.raise_for_status()
+        fields = r.json()
+        return {"from_fields": fields, "count": len(fields)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _list_gr_campaigns(page: int = 1, per_page: int = 100) -> Dict:
+    if not GR_API_KEY:
+        return {"error": "GR_API_KEY env var not configured on Railway"}
+    try:
+        with httpx.Client(timeout=30) as c:
+            r = c.get(f"{GR_BASE}/campaigns", headers=gr_headers(),
+                      params={"page": page, "perPage": per_page})
+            r.raise_for_status()
+        campaigns = r.json()
+        if isinstance(campaigns, dict):
+            campaigns = campaigns.get("campaigns", [])
+        simplified = [{"campaignId": c.get("campaignId"), "name": c.get("name"),
+                       "languageCode": c.get("languageCode")} for c in campaigns]
+        return {"campaigns": simplified, "count": len(simplified)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _create_gr_draft(name: str, subject: str, html: str,
+                     from_field_id: str, campaign_id: str,
+                     preheader: Optional[str] = None) -> Dict:
+    if not GR_API_KEY:
+        return {"error": "GR_API_KEY env var not configured on Railway"}
+
+    # Inject preheader as hidden span before body content if provided
+    if preheader:
+        preheader_span = (
+            f'<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">'
+            f'{preheader}'
+            f'</div>'
+        )
+        # Insert after first <table or at the very beginning if no table found
+        if "<table" in html:
+            html = html.replace("<table", preheader_span + "<table", 1)
+        else:
+            html = preheader_span + html
+
+    payload = {
+        "name": name,
+        "type": "broadcast",
+        "status": "draft",
+        "subject": subject,
+        "fromField": {"fromFieldId": from_field_id},
+        "replyTo":   {"fromFieldId": from_field_id},
+        "campaign":  {"campaignId": campaign_id},
+        "content": {
+            "html":  html,
+            "plain": "",
+        },
+        "flags": ["openrate", "clicktrack"],
+        "sendSettings": {
+            "selectedCampaigns": [{"campaignId": campaign_id}],
+        },
+    }
+
+    try:
+        with httpx.Client(timeout=60) as c:
+            r = c.post(f"{GR_BASE}/newsletters", headers={
+                **gr_headers(), "Content-Type": "application/json"
+            }, json=payload)
+            r.raise_for_status()
+        data = r.json()
+        newsletter_id = data.get("newsletterId") or data.get("id")
+        logger.info(f"Draft created: {newsletter_id} — '{name}'")
+        return {
+            "newsletterId": newsletter_id,
+            "name": name,
+            "subject": subject,
+            "status": data.get("status", "draft"),
+            "href": data.get("href"),
+        }
+    except httpx.HTTPStatusError as e:
+        return {"error": f"GR API error {e.response.status_code}: {e.response.text}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── MCP tool registry ─────────────────────────────────────────────────────────
 
 ALL_TOOLS = [
@@ -309,6 +399,48 @@ ALL_TOOLS = [
         description="Check whether FIGMA_PAT and GR_API_KEY are configured on this server.",
         inputSchema={"type": "object", "properties": {}},
     ),
+    Tool(
+        name="list_gr_from_fields",
+        description=(
+            "List available sender (From) addresses configured in GetResponse. "
+            "Returns fromFieldId and email for each. Required before calling create_gr_draft."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="list_gr_campaigns",
+        description=(
+            "List subscriber lists (campaigns) in GetResponse. "
+            "Returns campaignId and name. Required before calling create_gr_draft."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "page":     {"type": "integer", "description": "Page number (default 1)", "default": 1},
+                "per_page": {"type": "integer", "description": "Results per page (default 100)", "default": 100},
+            },
+        },
+    ),
+    Tool(
+        name="create_gr_draft",
+        description=(
+            "Create a newsletter draft in GetResponse with the provided HTML. "
+            "The draft appears in GetResponse → Newsletters → Drafts and is ready to schedule or send. "
+            "Call list_gr_from_fields and list_gr_campaigns first to obtain the required IDs."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name":           {"type": "string", "description": "Internal newsletter name (visible only in GR dashboard)"},
+                "subject":        {"type": "string", "description": "Email subject line shown to recipients"},
+                "html":           {"type": "string", "description": "Full HTML content of the email"},
+                "from_field_id":  {"type": "string", "description": "fromFieldId from list_gr_from_fields"},
+                "campaign_id":    {"type": "string", "description": "campaignId from list_gr_campaigns"},
+                "preheader":      {"type": "string", "description": "Optional preheader / preview text (injected as hidden span)"},
+            },
+            "required": ["name", "subject", "html", "from_field_id", "campaign_id"],
+        },
+    ),
 ]
 
 
@@ -343,6 +475,16 @@ def _dispatch(name: str, args: dict) -> Dict[str, Any]:
         return _list_gr_files(args.get("page", 1), args.get("per_page", 100))
     if name == "check_config":
         return _check_config()
+    if name == "list_gr_from_fields":
+        return _list_gr_from_fields()
+    if name == "list_gr_campaigns":
+        return _list_gr_campaigns(args.get("page", 1), args.get("per_page", 100))
+    if name == "create_gr_draft":
+        return _create_gr_draft(
+            args["name"], args["subject"], args["html"],
+            args["from_field_id"], args["campaign_id"],
+            preheader=args.get("preheader"),
+        )
     return {"error": f"Unknown tool: {name}"}
 
 
