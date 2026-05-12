@@ -1,0 +1,390 @@
+import logging
+import os
+import json
+import traceback
+import urllib.parse
+import uvicorn
+import httpx
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+from typing import Dict, Any, List, Optional
+
+from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse, HTMLResponse
+from starlette.routing import Route, Mount
+
+from mcp.server import Server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.types import Tool, TextContent
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+FIGMA_PAT  = os.environ.get("FIGMA_PAT", "")
+GR_API_KEY = os.environ.get("GR_API_KEY", "")
+GR_BASE    = "https://api.getresponse.com/v3"
+
+server          = Server("email-flow")
+session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
+
+
+# ── Figma helpers ─────────────────────────────────────────────────────────────
+
+def figma_export_urls(file_key: str, node_ids: List[str], scale: int = 2) -> Dict[str, str]:
+    """
+    Calls Figma Images API to get S3 export URLs for the given node IDs.
+    Each node is rendered at its exact design dimensions (with crop / object-fit:cover applied).
+    Returns {nodeId: s3Url}.
+    """
+    ids_param = urllib.parse.quote(",".join(node_ids))
+    url = f"https://api.figma.com/v1/images/{file_key}?ids={ids_param}&format=png&scale={scale}"
+    with httpx.Client(timeout=30) as c:
+        r = c.get(url, headers={"X-Figma-Token": FIGMA_PAT})
+        r.raise_for_status()
+        data = r.json()
+    if data.get("err"):
+        raise ValueError(f"Figma API error: {data['err']}")
+    return data.get("images", {})
+
+
+def figma_download(s3_url: str) -> bytes:
+    with httpx.Client(timeout=120, follow_redirects=True) as c:
+        r = c.get(s3_url)
+        r.raise_for_status()
+    return r.content
+
+
+def _normalize_node_id(node_id: str) -> str:
+    """Figma may return nodeIds as '923:87' or '923-87'; normalise to ':'."""
+    return node_id.replace("-", ":") if "-" in node_id and ":" not in node_id else node_id
+
+
+def _mime(filename: str) -> str:
+    ext = filename.lower().rsplit(".", 1)[-1]
+    return {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+            "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
+
+
+# ── GetResponse Files helpers ──────────────────────────────────────────────────
+
+def gr_headers() -> Dict[str, str]:
+    return {"X-Auth-Token": f"api-key {GR_API_KEY}"}
+
+
+def gr_upload(image_bytes: bytes, filename: str) -> str:
+    """
+    Uploads an image to GetResponse Files gallery.
+    Returns the public CDN URL.
+    """
+    with httpx.Client(timeout=120) as c:
+        r = c.post(
+            f"{GR_BASE}/files",
+            headers=gr_headers(),
+            files={"content": (filename, image_bytes, _mime(filename))},
+            data={"fileName": filename},
+        )
+        r.raise_for_status()
+        data = r.json()
+
+    # GR may return different field names depending on account type
+    cdn_url = (data.get("url") or data.get("publicUrl") or
+               data.get("fileUrl") or data.get("src") or
+               (data.get("file") or {}).get("url"))
+    if not cdn_url:
+        raise ValueError(f"GR upload succeeded but no URL in response: {json.dumps(data)}")
+    return cdn_url
+
+
+def gr_list(page: int = 1, per_page: int = 100) -> List[Dict]:
+    with httpx.Client(timeout=30) as c:
+        r = c.get(f"{GR_BASE}/files",
+                  headers=gr_headers(),
+                  params={"page": page, "perPage": per_page})
+        r.raise_for_status()
+    return r.json() if isinstance(r.json(), list) else r.json().get("files", [])
+
+
+# ── Tool implementations ───────────────────────────────────────────────────────
+
+def _upload_from_figma_to_gr(file_key: str, node_id: str, name: str, scale: int = 2) -> Dict:
+    """Export one Figma node and upload to GR. Returns gr_url."""
+    if not FIGMA_PAT:
+        return {"error": "FIGMA_PAT env var not configured on Railway"}
+    if not GR_API_KEY:
+        return {"error": "GR_API_KEY env var not configured on Railway"}
+
+    nid = _normalize_node_id(node_id)
+    try:
+        export_map = figma_export_urls(file_key, [nid], scale)
+    except Exception as e:
+        return {"error": f"Figma export failed: {e}"}
+
+    s3_url = export_map.get(nid) or export_map.get(node_id)
+    if not s3_url:
+        return {"error": f"No Figma export URL for nodeId '{nid}'. Got: {list(export_map.keys())}"}
+
+    try:
+        image_bytes = figma_download(s3_url)
+    except Exception as e:
+        return {"error": f"Image download failed: {e}"}
+
+    filename = f"{name}.png"
+    try:
+        gr_url = gr_upload(image_bytes, filename)
+    except Exception as e:
+        return {"error": f"GR upload failed: {e}"}
+
+    logger.info(f"Uploaded {filename} → {gr_url}")
+    return {"gr_url": gr_url, "name": name, "filename": filename, "size_bytes": len(image_bytes)}
+
+
+def _bulk_upload_from_figma_to_gr(file_key: str, nodes: List[Dict], scale: int = 2) -> Dict:
+    """
+    Bulk export + upload. nodes: [{nodeId, name}, ...].
+    One Figma API call for all nodes, then uploads sequentially.
+    Returns {uploaded: {name: gr_url}, errors: {name: reason}}.
+    """
+    if not FIGMA_PAT:
+        return {"error": "FIGMA_PAT env var not configured on Railway"}
+    if not GR_API_KEY:
+        return {"error": "GR_API_KEY env var not configured on Railway"}
+
+    node_ids = [_normalize_node_id(n["nodeId"]) for n in nodes]
+
+    try:
+        export_map = figma_export_urls(file_key, node_ids, scale)
+    except Exception as e:
+        return {"error": f"Figma batch export failed: {e}"}
+
+    uploaded: Dict[str, str] = {}
+    errors:   Dict[str, str] = {}
+
+    for node in nodes:
+        nid  = _normalize_node_id(node["nodeId"])
+        name = node["name"]
+        s3   = export_map.get(nid) or export_map.get(node["nodeId"])
+        if not s3:
+            errors[name] = f"No Figma export URL for nodeId '{nid}'"
+            continue
+        try:
+            img      = figma_download(s3)
+            gr_url   = gr_upload(img, f"{name}.png")
+            uploaded[name] = gr_url
+            logger.info(f"  ✓ {name} → {gr_url}")
+        except Exception as e:
+            errors[name] = str(e)
+            logger.error(f"  ✗ {name}: {e}")
+
+    return {
+        "uploaded": uploaded,
+        "errors":   errors,
+        "total":    len(nodes),
+        "success":  len(uploaded),
+        "failed":   len(errors),
+    }
+
+
+def _upload_url_to_gr(url: str, name: str) -> Dict:
+    """Download any public URL and upload to GR. Useful for logos, icons."""
+    if not GR_API_KEY:
+        return {"error": "GR_API_KEY env var not configured on Railway"}
+    try:
+        with httpx.Client(timeout=60, follow_redirects=True) as c:
+            r = c.get(url)
+            r.raise_for_status()
+            img = r.content
+            ct  = r.headers.get("content-type", "")
+    except Exception as e:
+        return {"error": f"Download failed: {e}"}
+
+    ext      = "jpg" if "jpeg" in ct else "png"
+    filename = f"{name}.{ext}"
+    try:
+        gr_url = gr_upload(img, filename)
+    except Exception as e:
+        return {"error": f"GR upload failed: {e}"}
+
+    return {"gr_url": gr_url, "name": name, "filename": filename}
+
+
+def _list_gr_files(page: int = 1, per_page: int = 100) -> Dict:
+    if not GR_API_KEY:
+        return {"error": "GR_API_KEY env var not configured on Railway"}
+    try:
+        files = gr_list(page, per_page)
+        return {"files": files, "count": len(files), "page": page}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _check_config() -> Dict:
+    return {
+        "figma_pat_set":  bool(FIGMA_PAT),
+        "gr_api_key_set": bool(GR_API_KEY),
+        "status": "ok" if (FIGMA_PAT and GR_API_KEY) else "missing_credentials",
+    }
+
+
+# ── MCP tool registry ─────────────────────────────────────────────────────────
+
+ALL_TOOLS = [
+    Tool(
+        name="upload_from_figma_to_gr",
+        description=(
+            "Export a single Figma node as PNG (rendered with exact crop, equivalent to "
+            "object-fit:cover) and upload it to GetResponse Files CDN. "
+            "Returns the permanent GR CDN URL ready to use in email HTML. "
+            "Use the node-id from Figma URL or from data-node-id attributes in design context."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "file_key": {"type": "string", "description": "Figma file key (from URL: figma.com/design/{fileKey}/...)"},
+                "node_id":  {"type": "string", "description": "Figma node ID, e.g. '923:87'"},
+                "name":     {"type": "string", "description": "Output filename (without extension), e.g. 'hero'"},
+                "scale":    {"type": "integer", "description": "Export scale: 1=1x, 2=2x retina (default)", "default": 2},
+            },
+            "required": ["file_key", "node_id", "name"],
+        },
+    ),
+    Tool(
+        name="bulk_upload_from_figma_to_gr",
+        description=(
+            "Export multiple Figma nodes in a single API call and upload all to GetResponse Files. "
+            "More efficient than calling upload_from_figma_to_gr repeatedly. "
+            "Returns mapping of name → GR CDN URL for all successfully uploaded images."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "file_key": {"type": "string", "description": "Figma file key"},
+                "nodes": {
+                    "type": "array",
+                    "description": "List of nodes to export",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "nodeId": {"type": "string", "description": "Figma node ID, e.g. '923:87'"},
+                            "name":   {"type": "string", "description": "Output filename (no extension)"},
+                        },
+                        "required": ["nodeId", "name"],
+                    },
+                },
+                "scale": {"type": "integer", "description": "Export scale: 1 or 2 (retina, default)", "default": 2},
+            },
+            "required": ["file_key", "nodes"],
+        },
+    ),
+    Tool(
+        name="upload_url_to_gr",
+        description=(
+            "Download any public image URL and upload it to GetResponse Files CDN. "
+            "Useful for uploading icons, logos, or images from other sources."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "url":  {"type": "string", "description": "Public image URL to download"},
+                "name": {"type": "string", "description": "Output filename (without extension)"},
+            },
+            "required": ["url", "name"],
+        },
+    ),
+    Tool(
+        name="list_gr_files",
+        description="List files already uploaded to GetResponse Files gallery.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "page":     {"type": "integer", "description": "Page number (default 1)", "default": 1},
+                "per_page": {"type": "integer", "description": "Results per page (default 100)", "default": 100},
+            },
+        },
+    ),
+    Tool(
+        name="check_config",
+        description="Check whether FIGMA_PAT and GR_API_KEY are configured on this server.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+]
+
+
+@server.list_tools()
+async def list_tools():
+    return ALL_TOOLS
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict):
+    try:
+        result = _dispatch(name, arguments)
+    except Exception as e:
+        result = {"error": str(e), "traceback": traceback.format_exc()}
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+def _dispatch(name: str, args: dict) -> Dict[str, Any]:
+    if name == "upload_from_figma_to_gr":
+        return _upload_from_figma_to_gr(
+            args["file_key"], args["node_id"], args["name"],
+            scale=args.get("scale", 2),
+        )
+    if name == "bulk_upload_from_figma_to_gr":
+        return _bulk_upload_from_figma_to_gr(
+            args["file_key"], args["nodes"],
+            scale=args.get("scale", 2),
+        )
+    if name == "upload_url_to_gr":
+        return _upload_url_to_gr(args["url"], args["name"])
+    if name == "list_gr_files":
+        return _list_gr_files(args.get("page", 1), args.get("per_page", 100))
+    if name == "check_config":
+        return _check_config()
+    return {"error": f"Unknown tool: {name}"}
+
+
+# ── Starlette app ─────────────────────────────────────────────────────────────
+
+async def health(request):
+    return JSONResponse({"status": "ok", "server": "email-flow"})
+
+
+async def dashboard(request):
+    figma_ok = "✅" if FIGMA_PAT  else "❌ FIGMA_PAT not set"
+    gr_ok    = "✅" if GR_API_KEY else "❌ GR_API_KEY not set"
+    html = f"""<!DOCTYPE html><html><head><title>MCP Email Flow</title>
+    <style>body{{font-family:system-ui;max-width:600px;margin:60px auto;padding:0 20px;color:#1a1a1a}}
+    h1{{font-size:1.4rem;font-weight:600}}
+    .tag{{display:inline-block;padding:2px 10px;border-radius:20px;font-size:.85rem;background:#f0f0f0;margin:4px 0}}
+    </style></head><body>
+    <h1>MCP Email Flow</h1>
+    <p>Figma → GetResponse image pipeline for email newsletters.</p>
+    <p><b>Figma PAT:</b> {figma_ok}</p>
+    <p><b>GR API Key:</b> {gr_ok}</p>
+    <p><b>MCP endpoint:</b> <code>/mcp</code></p>
+    <hr>
+    <p><b>Tools:</b></p>
+    {''.join(f'<span class="tag">{t.name}</span><br>' for t in ALL_TOOLS)}
+    </body></html>"""
+    return HTMLResponse(html)
+
+
+async def handle_mcp(scope, receive, send):
+    await session_manager.handle_request(scope, receive, send)
+
+
+app = Starlette(
+    routes=[
+        Route("/",       endpoint=dashboard),
+        Route("/health", endpoint=health),
+        Mount("/mcp",    app=handle_mcp),
+    ]
+)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    logger.info(f"Starting MCP Email Flow on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
