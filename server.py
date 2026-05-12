@@ -25,7 +25,7 @@ from mcp.types import Tool, TextContent
 
 FIGMA_PAT  = os.environ.get("FIGMA_PAT", "")
 GR_API_KEY = os.environ.get("GR_API_KEY", "")
-GR_BASE    = "https://api.getresponse.com/v3"
+GR_BASE    = os.environ.get("GR_BASE", "https://api.getresponse.com/v3").rstrip("/")
 
 server          = Server("email-flow")
 session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
@@ -224,6 +224,7 @@ def _check_config() -> Dict:
     return {
         "figma_pat_set":  bool(FIGMA_PAT),
         "gr_api_key_set": bool(GR_API_KEY),
+        "gr_base":        GR_BASE,
         "status": "ok" if (FIGMA_PAT and GR_API_KEY) else "missing_credentials",
     }
 
@@ -506,6 +507,7 @@ async def dashboard(request):
     <p>Figma → GetResponse image pipeline for email newsletters.</p>
     <p><b>Figma PAT:</b> {figma_ok}</p>
     <p><b>GR API Key:</b> {gr_ok}</p>
+    <p><b>GR API base:</b> <code>{GR_BASE}</code></p>
     <p><b>MCP endpoint:</b> <code>/mcp</code></p>
     <hr>
     <p><b>Tools:</b></p>
