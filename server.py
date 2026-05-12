@@ -6,6 +6,10 @@ import urllib.parse
 import uvicorn
 import httpx
 import contextlib
+import hashlib
+import hmac
+import time
+import base64
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -23,9 +27,10 @@ from mcp.types import Tool, TextContent
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-FIGMA_PAT  = os.environ.get("FIGMA_PAT", "")
-GR_API_KEY = os.environ.get("GR_API_KEY", "")
-GR_BASE    = os.environ.get("GR_BASE", "https://api.getresponse.com/v3").rstrip("/")
+FIGMA_PAT        = os.environ.get("FIGMA_PAT", "")
+GR_API_KEY       = os.environ.get("GR_API_KEY", "")
+GR_BASE          = os.environ.get("GR_BASE", "https://api.getresponse.com/v3").rstrip("/")
+CLOUDINARY_URL   = os.environ.get("CLOUDINARY_URL", "")  # cloudinary://api_key:api_secret@cloud_name
 
 server          = Server("email-flow")
 session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
@@ -68,6 +73,36 @@ def _mime(filename: str) -> str:
             "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
 
 
+# ── Cloudinary helpers ────────────────────────────────────────────────────────
+
+def _parse_cloudinary_url(url: str):
+    """Parse cloudinary://api_key:api_secret@cloud_name"""
+    if not url.startswith("cloudinary://"):
+        raise ValueError("CLOUDINARY_URL must be cloudinary://api_key:api_secret@cloud_name")
+    rest = url[len("cloudinary://"):]
+    creds, cloud_name = rest.rsplit("@", 1)
+    api_key, api_secret = creds.split(":", 1)
+    return api_key, api_secret, cloud_name
+
+
+def cloudinary_upload(image_bytes: bytes, public_id: str) -> str:
+    """Upload image to Cloudinary, return secure CDN URL."""
+    api_key, api_secret, cloud_name = _parse_cloudinary_url(CLOUDINARY_URL)
+    ts = str(int(time.time()))
+    params_to_sign = f"public_id={public_id}&timestamp={ts}"
+    signature = hmac.new(api_secret.encode(), params_to_sign.encode(), hashlib.sha1).hexdigest()
+    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/image/upload"
+    with httpx.Client(timeout=120) as c:
+        r = c.post(url, data={
+            "api_key":   api_key,
+            "timestamp": ts,
+            "public_id": public_id,
+            "signature": signature,
+        }, files={"file": (f"{public_id}.png", image_bytes, "image/png")})
+        r.raise_for_status()
+    return r.json()["secure_url"]
+
+
 # ── GetResponse Files helpers ──────────────────────────────────────────────────
 
 def gr_headers() -> Dict[str, str]:
@@ -78,6 +113,7 @@ def gr_upload(image_bytes: bytes, filename: str) -> str:
     """
     Uploads an image to GetResponse Files gallery.
     Returns the public CDN URL.
+    Raises httpx.HTTPStatusError on failure (caller may catch 404 and fall back).
     """
     with httpx.Client(timeout=120) as c:
         r = c.post(
@@ -89,13 +125,29 @@ def gr_upload(image_bytes: bytes, filename: str) -> str:
         r.raise_for_status()
         data = r.json()
 
-    # GR may return different field names depending on account type
     cdn_url = (data.get("url") or data.get("publicUrl") or
                data.get("fileUrl") or data.get("src") or
                (data.get("file") or {}).get("url"))
     if not cdn_url:
         raise ValueError(f"GR upload succeeded but no URL in response: {json.dumps(data)}")
     return cdn_url
+
+
+def upload_image(image_bytes: bytes, filename: str) -> tuple[str, str]:
+    """
+    Upload image to best available CDN.
+    Returns (cdn_url, provider) where provider is 'getresponse' or 'cloudinary'.
+    Tries GR first; falls back to Cloudinary if GR returns 404.
+    """
+    try:
+        url = gr_upload(image_bytes, filename)
+        return url, "getresponse"
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404 and CLOUDINARY_URL:
+            public_id = filename.rsplit(".", 1)[0]
+            url = cloudinary_upload(image_bytes, public_id)
+            return url, "cloudinary"
+        raise
 
 
 def gr_list(page: int = 1, per_page: int = 100) -> List[Dict]:
@@ -133,12 +185,12 @@ def _upload_from_figma_to_gr(file_key: str, node_id: str, name: str, scale: int 
 
     filename = f"{name}.png"
     try:
-        gr_url = gr_upload(image_bytes, filename)
+        cdn_url, provider = upload_image(image_bytes, filename)
     except Exception as e:
-        return {"error": f"GR upload failed: {e}"}
+        return {"error": f"Upload failed: {e}"}
 
-    logger.info(f"Uploaded {filename} → {gr_url}")
-    return {"gr_url": gr_url, "name": name, "filename": filename, "size_bytes": len(image_bytes)}
+    logger.info(f"Uploaded {filename} via {provider} → {cdn_url}")
+    return {"cdn_url": cdn_url, "provider": provider, "name": name, "filename": filename, "size_bytes": len(image_bytes)}
 
 
 def _bulk_upload_from_figma_to_gr(file_key: str, nodes: List[Dict], scale: int = 2) -> Dict:
@@ -170,10 +222,10 @@ def _bulk_upload_from_figma_to_gr(file_key: str, nodes: List[Dict], scale: int =
             errors[name] = f"No Figma export URL for nodeId '{nid}'"
             continue
         try:
-            img      = figma_download(s3)
-            gr_url   = gr_upload(img, f"{name}.png")
-            uploaded[name] = gr_url
-            logger.info(f"  ✓ {name} → {gr_url}")
+            img = figma_download(s3)
+            cdn_url, provider = upload_image(img, f"{name}.png")
+            uploaded[name] = cdn_url
+            logger.info(f"  ✓ {name} via {provider} → {cdn_url}")
         except Exception as e:
             errors[name] = str(e)
             logger.error(f"  ✗ {name}: {e}")
@@ -203,11 +255,11 @@ def _upload_url_to_gr(url: str, name: str) -> Dict:
     ext      = "jpg" if "jpeg" in ct else "png"
     filename = f"{name}.{ext}"
     try:
-        gr_url = gr_upload(img, filename)
+        cdn_url, provider = upload_image(img, filename)
     except Exception as e:
-        return {"error": f"GR upload failed: {e}"}
+        return {"error": f"Upload failed: {e}"}
 
-    return {"gr_url": gr_url, "name": name, "filename": filename}
+    return {"cdn_url": cdn_url, "provider": provider, "name": name, "filename": filename}
 
 
 def _list_gr_files(page: int = 1, per_page: int = 100) -> Dict:
@@ -221,10 +273,13 @@ def _list_gr_files(page: int = 1, per_page: int = 100) -> Dict:
 
 
 def _check_config() -> Dict:
+    cdn = "cloudinary" if CLOUDINARY_URL else "getresponse_files"
     return {
-        "figma_pat_set":  bool(FIGMA_PAT),
-        "gr_api_key_set": bool(GR_API_KEY),
-        "gr_base":        GR_BASE,
+        "figma_pat_set":      bool(FIGMA_PAT),
+        "gr_api_key_set":     bool(GR_API_KEY),
+        "cloudinary_set":     bool(CLOUDINARY_URL),
+        "image_cdn":          cdn,
+        "gr_base":            GR_BASE,
         "status": "ok" if (FIGMA_PAT and GR_API_KEY) else "missing_credentials",
     }
 
@@ -496,8 +551,10 @@ async def health(request):
 
 
 async def dashboard(request):
-    figma_ok = "✅" if FIGMA_PAT  else "❌ FIGMA_PAT not set"
-    gr_ok    = "✅" if GR_API_KEY else "❌ GR_API_KEY not set"
+    figma_ok   = "✅" if FIGMA_PAT      else "❌ FIGMA_PAT not set"
+    gr_ok      = "✅" if GR_API_KEY     else "❌ GR_API_KEY not set"
+    cloud_ok   = "✅" if CLOUDINARY_URL else "⚠️ not set (will use GR Files)"
+    cdn_active = "Cloudinary" if CLOUDINARY_URL else "GetResponse Files"
     html = f"""<!DOCTYPE html><html><head><title>MCP Email Flow</title>
     <style>body{{font-family:system-ui;max-width:600px;margin:60px auto;padding:0 20px;color:#1a1a1a}}
     h1{{font-size:1.4rem;font-weight:600}}
@@ -507,6 +564,8 @@ async def dashboard(request):
     <p>Figma → GetResponse image pipeline for email newsletters.</p>
     <p><b>Figma PAT:</b> {figma_ok}</p>
     <p><b>GR API Key:</b> {gr_ok}</p>
+    <p><b>Cloudinary:</b> {cloud_ok}</p>
+    <p><b>Image CDN:</b> {cdn_active}</p>
     <p><b>GR API base:</b> <code>{GR_BASE}</code></p>
     <p><b>MCP endpoint:</b> <code>/mcp</code></p>
     <hr>
