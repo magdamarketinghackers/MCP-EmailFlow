@@ -5,6 +5,7 @@ import traceback
 import urllib.parse
 import uvicorn
 import httpx
+import contextlib
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -14,7 +15,7 @@ from typing import Dict, Any, List, Optional
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse, HTMLResponse
-from starlette.routing import Route, Mount
+from starlette.routing import Route
 
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -371,20 +372,36 @@ async def dashboard(request):
     return HTMLResponse(html)
 
 
-async def handle_mcp(scope, receive, send):
+async def mcp_asgi(scope, receive, send):
     await session_manager.handle_request(scope, receive, send)
 
 
-app = Starlette(
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    async with session_manager.run():
+        yield
+
+
+_starlette_app = Starlette(
     routes=[
         Route("/",       endpoint=dashboard),
         Route("/health", endpoint=health),
-        Mount("/mcp",    app=handle_mcp),
-    ]
+    ],
+    lifespan=lifespan,
 )
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+_starlette_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+async def app(scope, receive, send):
+    """Top-level ASGI dispatcher: /mcp goes directly to session_manager
+    (avoids Starlette Mount trailing-slash redirect that drops POST bodies)."""
+    if scope["type"] == "http" and scope.get("path", "").rstrip("/") == "/mcp":
+        await session_manager.handle_request(scope, receive, send)
+        return
+    await _starlette_app(scope, receive, send)
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting MCP Email Flow on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("server:app", host="0.0.0.0", port=port)
