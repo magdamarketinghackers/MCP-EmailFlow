@@ -6,9 +6,6 @@ import urllib.parse
 import uvicorn
 import httpx
 import contextlib
-import hashlib
-import hmac
-import time
 import base64
 import cairosvg
 
@@ -28,12 +25,68 @@ from mcp.types import Tool, TextContent
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-FIGMA_PAT        = os.environ.get("FIGMA_PAT", "")
-GR_API_KEY       = os.environ.get("GR_API_KEY", "")
-GR_BASE          = os.environ.get("GR_BASE", "https://api.getresponse.com/v3").rstrip("/")
-CLOUDINARY_URL   = os.environ.get("CLOUDINARY_URL", "")  # cloudinary://api_key:api_secret@cloud_name
+FIGMA_PAT                = os.environ.get("FIGMA_PAT", "")
+GR_API_KEY               = os.environ.get("GR_API_KEY", "")
+GR_BASE                  = os.environ.get("GR_BASE", "https://api.getresponse.com/v3").rstrip("/")
+GR_DEFAULT_FROM_FIELD_ID = os.environ.get("GR_DEFAULT_FROM_FIELD_ID", "rV7P7")  # IVERESSE
+GR_DEFAULT_CAMPAIGN_ID   = os.environ.get("GR_DEFAULT_CAMPAIGN_ID",   "L9fb4")  # Main
 
-server          = Server("email-flow")
+SERVER_INSTRUCTIONS = """
+This server creates GetResponse email drafts from Figma designs (Iveresse newsletters).
+
+══════════════════════════════════════════════════════════════════════════
+WORKFLOW
+══════════════════════════════════════════════════════════════════════════
+When the user wants to create an email from Figma, follow this exact flow:
+
+1. ASK USER for any of these that weren't provided up-front:
+   • Figma URL or node-id (must contain fileKey + nodeId)
+   • Email subject (the line shown in inbox, max 128 chars)
+   • Preheader / preview text (1-2 sentences shown next to subject)
+
+   Defaults that DON'T need asking unless user overrides them:
+   • Sender (from-field): IVERESSE / shop@iveresse.com (rV7P7)
+   • List (campaign):     Main (L9fb4)
+
+2. FETCH DESIGN via Figma MCP (OAuth — bypasses Figma PAT issues):
+   Call mcp__claude_ai_Figma__get_design_context with fileKey + nodeId.
+   Response includes image URLs like https://www.figma.com/api/mcp/asset/<uuid>
+
+3. UPLOAD IMAGES via this server:
+   Call bulk_upload_urls_to_gr with items=[{url, name}, ...]
+   Returns permanent GR CDN URLs (https://us-ms.gr-cdn.com/getresponse-*/photos/*.png).
+   SVG icons are auto-converted to PNG at 4x scale (Figma's CSS var() is handled).
+
+4. GENERATE HTML matching the Figma design 1:1:
+   • Width: 640px, font: Jost (already in GR templates)
+   • Table-based layout. NO <!DOCTYPE>, <html>, <head>, <body> — GR wraps it.
+   • Font-weight: Figma 500 (Medium) → CSS 700 (Bold). Email clients lack Medium variants.
+   • object-fit:cover; object-position:center on photos (Outlook ignores it but Figma export already crops correctly).
+   • DO NOT add {unsubscribe} or unsubscribe link — GR appends automatically.
+
+5. CREATE DRAFT via this server:
+   Call create_gr_draft with: name (internal), subject, html, preheader.
+   from_field_id and campaign_id are optional — defaults are applied.
+
+══════════════════════════════════════════════════════════════════════════
+KEY TOOLS
+══════════════════════════════════════════════════════════════════════════
+• bulk_upload_urls_to_gr — main image upload (auto SVG→PNG, GR File Library)
+• create_gr_draft        — final step, creates editable draft in GR
+• list_gr_from_fields    — only call if user wants different sender
+• list_gr_campaigns      — only call if user wants different list
+• list_gr_drafts         — for management/cleanup
+• delete_gr_drafts       — bulk delete by IDs
+
+══════════════════════════════════════════════════════════════════════════
+NOTES
+══════════════════════════════════════════════════════════════════════════
+• GR File Library doesn't accept SVG — server converts to PNG transparently.
+• If user gives just a Figma URL, parse fileKey from /design/<fileKey>/ and nodeId from ?node-id=<X-Y>.
+• Don't double-upload same images — if user runs the flow twice for tweaks, reuse URLs from prior bulk_upload_urls_to_gr response.
+"""
+
+server          = Server("email-flow", instructions=SERVER_INSTRUCTIONS)
 session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
 
 
@@ -72,36 +125,6 @@ def _mime(filename: str) -> str:
     ext = filename.lower().rsplit(".", 1)[-1]
     return {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
             "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
-
-
-# ── Cloudinary helpers ────────────────────────────────────────────────────────
-
-def _parse_cloudinary_url(url: str):
-    """Parse cloudinary://api_key:api_secret@cloud_name"""
-    if not url.startswith("cloudinary://"):
-        raise ValueError("CLOUDINARY_URL must be cloudinary://api_key:api_secret@cloud_name")
-    rest = url[len("cloudinary://"):]
-    creds, cloud_name = rest.rsplit("@", 1)
-    api_key, api_secret = creds.split(":", 1)
-    return api_key, api_secret, cloud_name
-
-
-def cloudinary_upload(image_bytes: bytes, public_id: str) -> str:
-    """Upload image to Cloudinary, return secure CDN URL."""
-    api_key, api_secret, cloud_name = _parse_cloudinary_url(CLOUDINARY_URL)
-    ts = str(int(time.time()))
-    params_to_sign = f"public_id={public_id}&timestamp={ts}"
-    signature = hmac.new(api_secret.encode(), params_to_sign.encode(), hashlib.sha1).hexdigest()
-    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/image/upload"
-    with httpx.Client(timeout=120) as c:
-        r = c.post(url, data={
-            "api_key":   api_key,
-            "timestamp": ts,
-            "public_id": public_id,
-            "signature": signature,
-        }, files={"file": (f"{public_id}.png", image_bytes, "image/png")})
-        r.raise_for_status()
-    return r.json()["secure_url"]
 
 
 # ── GetResponse Files helpers ──────────────────────────────────────────────────
@@ -184,26 +207,17 @@ def _svg_to_png(svg_bytes: bytes, scale: int = 4) -> bytes:
     return cairosvg.svg2png(**kwargs)
 
 
-def upload_image(image_bytes: bytes, filename: str, content_type: str = "") -> tuple[str, str]:
+def upload_image(image_bytes: bytes, filename: str, content_type: str = "") -> str:
     """
-    Upload image to best available CDN.
-    Returns (cdn_url, provider) where provider is 'getresponse' or 'cloudinary'.
-    Tries GR first; falls back to Cloudinary if GR returns 404.
-    Converts SVG to PNG before upload (GR File Library doesn't accept SVG).
+    Upload image to GR File Library.
+    Auto-converts SVG to PNG (GR doesn't accept SVG).
+    Returns the GR CDN URL.
     """
     if _is_svg(image_bytes, content_type):
         image_bytes = _svg_to_png(image_bytes)
         base = filename.rsplit(".", 1)[0]
         filename = f"{base}.png"
-    try:
-        url = gr_upload(image_bytes, filename)
-        return url, "getresponse"
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404 and CLOUDINARY_URL:
-            public_id = filename.rsplit(".", 1)[0]
-            url = cloudinary_upload(image_bytes, public_id)
-            return url, "cloudinary"
-        raise
+    return gr_upload(image_bytes, filename)
 
 
 def gr_list(page: int = 1, per_page: int = 100) -> List[Dict]:
@@ -242,12 +256,12 @@ def _upload_from_figma_to_gr(file_key: str, node_id: str, name: str, scale: int 
 
     filename = f"{name}.png"
     try:
-        cdn_url, provider = upload_image(image_bytes, filename)
+        cdn_url = upload_image(image_bytes, filename)
     except Exception as e:
         return {"error": f"Upload failed: {e}"}
 
-    logger.info(f"Uploaded {filename} via {provider} → {cdn_url}")
-    return {"cdn_url": cdn_url, "provider": provider, "name": name, "filename": filename, "size_bytes": len(image_bytes)}
+    logger.info(f"Uploaded {filename} → {cdn_url}")
+    return {"cdn_url": cdn_url, "name": name, "filename": filename, "size_bytes": len(image_bytes)}
 
 
 def _bulk_upload_from_figma_to_gr(file_key: str, nodes: List[Dict], scale: int = 2) -> Dict:
@@ -280,9 +294,9 @@ def _bulk_upload_from_figma_to_gr(file_key: str, nodes: List[Dict], scale: int =
             continue
         try:
             img = figma_download(s3)
-            cdn_url, provider = upload_image(img, f"{name}.png")
+            cdn_url = upload_image(img, f"{name}.png")
             uploaded[name] = cdn_url
-            logger.info(f"  ✓ {name} via {provider} → {cdn_url}")
+            logger.info(f"  ✓ {name} → {cdn_url}")
         except Exception as e:
             errors[name] = str(e)
             logger.error(f"  ✗ {name}: {e}")
@@ -323,9 +337,9 @@ def _bulk_upload_urls_to_gr(items: List[Dict]) -> Dict:
                 ext = "jpg"
             else:
                 ext = "png"
-            cdn_url, provider = upload_image(img, f"{name}.{ext}", content_type=ct)
+            cdn_url = upload_image(img, f"{name}.{ext}", content_type=ct)
             uploaded[name] = cdn_url
-            logger.info(f"  ✓ {name} via {provider} → {cdn_url}")
+            logger.info(f"  ✓ {name} → {cdn_url}")
         except Exception as e:
             errors[name] = str(e)
             logger.error(f"  ✗ {name}: {e}")
@@ -360,11 +374,11 @@ def _upload_url_to_gr(url: str, name: str) -> Dict:
         ext = "png"
     filename = f"{name}.{ext}"
     try:
-        cdn_url, provider = upload_image(img, filename, content_type=ct)
+        cdn_url = upload_image(img, filename, content_type=ct)
     except Exception as e:
         return {"error": f"Upload failed: {e}"}
 
-    return {"cdn_url": cdn_url, "provider": provider, "name": name, "filename": filename}
+    return {"cdn_url": cdn_url, "name": name, "filename": filename}
 
 
 def _list_gr_files(page: int = 1, per_page: int = 100) -> Dict:
@@ -375,51 +389,6 @@ def _list_gr_files(page: int = 1, per_page: int = 100) -> Dict:
         return {"files": files, "count": len(files), "page": page}
     except Exception as e:
         return {"error": str(e)}
-
-
-def _test_figma_token() -> Dict:
-    """
-    Test the FIGMA_PAT against key endpoints.
-    Note: /v1/me is excluded for Plan (org) access tokens — we skip it.
-    """
-    if not FIGMA_PAT:
-        return {"error": "FIGMA_PAT not set"}
-    file_key = "LchycCBdOmUOuABklxHXqp"
-    headers  = {"X-Figma-Token": FIGMA_PAT, "User-Agent": "Mozilla/5.0"}
-    results  = {"token_prefix": FIGMA_PAT[:10] + "..."}
-    try:
-        with httpx.Client(timeout=15) as c:
-            # Try X-Figma-Token header (standard PAT)
-            r1 = c.get(f"https://api.figma.com/v1/files/{file_key}?depth=1", headers={"X-Figma-Token": FIGMA_PAT})
-            results["x_figma_token_status"] = r1.status_code
-
-            # Try Authorization: Bearer (OAuth / developer tokens)
-            r2 = c.get(f"https://api.figma.com/v1/files/{file_key}?depth=1",
-                       headers={"Authorization": f"Bearer {FIGMA_PAT}"})
-            results["bearer_status"] = r2.status_code
-
-            if r1.status_code == 200:
-                results["auth_method"] = "X-Figma-Token"
-                results["file_name"] = r1.json().get("name")
-            elif r2.status_code == 200:
-                results["auth_method"] = "Bearer"
-                results["file_name"] = r2.json().get("name")
-
-            # Image export with whichever header worked
-            working_headers = ({"X-Figma-Token": FIGMA_PAT} if r1.status_code == 200
-                               else {"Authorization": f"Bearer {FIGMA_PAT}"})
-            r3 = c.get(
-                f"https://api.figma.com/v1/images/{file_key}?ids=923%3A83&format=png&scale=1",
-                headers=working_headers
-            )
-            results["image_export_status"] = r3.status_code
-            if r3.status_code == 200:
-                results["image_export_ok"] = True
-            else:
-                results["image_export_error"] = r3.text[:200]
-    except Exception as e:
-        results["error"] = str(e)
-    return results
 
 
 def _list_gr_drafts(page: int = 1, per_page: int = 100, name_filter: Optional[str] = None) -> Dict:
@@ -460,14 +429,13 @@ def _delete_gr_drafts(newsletter_ids: List[str]) -> Dict:
 
 
 def _check_config() -> Dict:
-    cdn = "cloudinary" if CLOUDINARY_URL else "getresponse_files"
     return {
-        "figma_pat_set":      bool(FIGMA_PAT),
-        "gr_api_key_set":     bool(GR_API_KEY),
-        "cloudinary_set":     bool(CLOUDINARY_URL),
-        "image_cdn":          cdn,
-        "gr_base":            GR_BASE,
-        "status": "ok" if (FIGMA_PAT and GR_API_KEY) else "missing_credentials",
+        "figma_pat_set":            bool(FIGMA_PAT),
+        "gr_api_key_set":           bool(GR_API_KEY),
+        "gr_base":                  GR_BASE,
+        "default_from_field_id":    GR_DEFAULT_FROM_FIELD_ID,
+        "default_campaign_id":      GR_DEFAULT_CAMPAIGN_ID,
+        "status": "ok" if GR_API_KEY else "missing_credentials",
     }
 
 
@@ -503,10 +471,21 @@ def _list_gr_campaigns(page: int = 1, per_page: int = 100) -> Dict:
 
 
 def _create_gr_draft(name: str, subject: str, html: str,
-                     from_field_id: str, campaign_id: str,
-                     preheader: Optional[str] = None) -> Dict:
+                     from_field_id: Optional[str] = None,
+                     campaign_id:   Optional[str] = None,
+                     preheader:     Optional[str] = None) -> Dict:
     if not GR_API_KEY:
         return {"error": "GR_API_KEY env var not configured on Railway"}
+
+    from_field_id = from_field_id or GR_DEFAULT_FROM_FIELD_ID
+    campaign_id   = campaign_id   or GR_DEFAULT_CAMPAIGN_ID
+
+    if not (subject and 2 <= len(subject) <= 128):
+        return {"error": f"subject must be 2-128 chars (got {len(subject) if subject else 0})"}
+    if not (name and 2 <= len(name) <= 128):
+        return {"error": f"name must be 2-128 chars (got {len(name) if name else 0})"}
+    if not html or len(html.strip()) < 10:
+        return {"error": "html is empty or too short"}
 
     # Inject preheader as hidden span before body content if provided
     if preheader:
@@ -687,11 +666,6 @@ ALL_TOOLS = [
         },
     ),
     Tool(
-        name="test_figma_token",
-        description="Debug: test if FIGMA_PAT is valid and has access to the Iveresse file.",
-        inputSchema={"type": "object", "properties": {}},
-    ),
-    Tool(
         name="check_config",
         description="Check whether FIGMA_PAT and GR_API_KEY are configured on this server.",
         inputSchema={"type": "object", "properties": {}},
@@ -723,19 +697,20 @@ ALL_TOOLS = [
         description=(
             "Create a newsletter draft in GetResponse with the provided HTML. "
             "The draft appears in GetResponse → Newsletters → Drafts and is ready to schedule or send. "
-            "Call list_gr_from_fields and list_gr_campaigns first to obtain the required IDs."
+            "from_field_id and campaign_id default to IVERESSE sender and Main list — "
+            "only override if user requests a different sender/list."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "name":           {"type": "string", "description": "Internal newsletter name (visible only in GR dashboard)"},
-                "subject":        {"type": "string", "description": "Email subject line shown to recipients"},
+                "name":           {"type": "string", "description": "Internal newsletter name (visible only in GR dashboard, 2-128 chars)"},
+                "subject":        {"type": "string", "description": "Email subject line shown to recipients (2-128 chars)"},
                 "html":           {"type": "string", "description": "Full HTML content of the email"},
-                "from_field_id":  {"type": "string", "description": "fromFieldId from list_gr_from_fields"},
-                "campaign_id":    {"type": "string", "description": "campaignId from list_gr_campaigns"},
-                "preheader":      {"type": "string", "description": "Optional preheader / preview text (injected as hidden span)"},
+                "preheader":      {"type": "string", "description": "Preview text shown next to subject in inbox (recommended)"},
+                "from_field_id":  {"type": "string", "description": "Optional. fromFieldId from list_gr_from_fields. Defaults to IVERESSE."},
+                "campaign_id":    {"type": "string", "description": "Optional. campaignId from list_gr_campaigns. Defaults to Main list."},
             },
-            "required": ["name", "subject", "html", "from_field_id", "campaign_id"],
+            "required": ["name", "subject", "html"],
         },
     ),
 ]
@@ -774,8 +749,6 @@ def _dispatch(name: str, args: dict) -> Dict[str, Any]:
         return _list_gr_files(args.get("page", 1), args.get("per_page", 100))
     if name == "check_config":
         return _check_config()
-    if name == "test_figma_token":
-        return _test_figma_token()
     if name == "list_gr_drafts":
         return _list_gr_drafts(args.get("page", 1), args.get("per_page", 100), args.get("name_filter"))
     if name == "delete_gr_drafts":
@@ -787,7 +760,8 @@ def _dispatch(name: str, args: dict) -> Dict[str, Any]:
     if name == "create_gr_draft":
         return _create_gr_draft(
             args["name"], args["subject"], args["html"],
-            args["from_field_id"], args["campaign_id"],
+            from_field_id=args.get("from_field_id"),
+            campaign_id=args.get("campaign_id"),
             preheader=args.get("preheader"),
         )
     return {"error": f"Unknown tool: {name}"}
@@ -800,10 +774,8 @@ async def health(request):
 
 
 async def dashboard(request):
-    figma_ok   = "✅" if FIGMA_PAT      else "❌ FIGMA_PAT not set"
-    gr_ok      = "✅" if GR_API_KEY     else "❌ GR_API_KEY not set"
-    cloud_ok   = "✅" if CLOUDINARY_URL else "⚠️ not set (will use GR Files)"
-    cdn_active = "Cloudinary" if CLOUDINARY_URL else "GetResponse Files"
+    figma_ok = "✅" if FIGMA_PAT  else "⚠️ not set (Figma MCP via Claude OAuth is preferred anyway)"
+    gr_ok    = "✅" if GR_API_KEY else "❌ GR_API_KEY not set"
     html = f"""<!DOCTYPE html><html><head><title>MCP Email Flow</title>
     <style>body{{font-family:system-ui;max-width:600px;margin:60px auto;padding:0 20px;color:#1a1a1a}}
     h1{{font-size:1.4rem;font-weight:600}}
@@ -813,9 +785,9 @@ async def dashboard(request):
     <p>Figma → GetResponse image pipeline for email newsletters.</p>
     <p><b>Figma PAT:</b> {figma_ok}</p>
     <p><b>GR API Key:</b> {gr_ok}</p>
-    <p><b>Cloudinary:</b> {cloud_ok}</p>
-    <p><b>Image CDN:</b> {cdn_active}</p>
     <p><b>GR API base:</b> <code>{GR_BASE}</code></p>
+    <p><b>Default sender:</b> <code>{GR_DEFAULT_FROM_FIELD_ID}</code></p>
+    <p><b>Default list:</b> <code>{GR_DEFAULT_CAMPAIGN_ID}</code></p>
     <p><b>MCP endpoint:</b> <code>/mcp</code></p>
     <hr>
     <p><b>Tools:</b></p>
