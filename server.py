@@ -156,24 +156,32 @@ def _is_svg(content: bytes, content_type: str = "") -> bool:
 def _svg_to_png(svg_bytes: bytes, scale: int = 4) -> bytes:
     """
     Render SVG to PNG. scale upsamples small icons for crisp display.
-    Falls back to explicit dimensions when SVG uses % units (Figma exports).
+    Preprocesses Figma-specific SVG quirks (CSS var(), % dimensions).
     """
-    try:
-        return cairosvg.svg2png(bytestring=svg_bytes, scale=scale)
-    except Exception:
-        # Parse viewBox to get intrinsic dimensions (Figma SVGs use width="100%")
-        import re
-        text = svg_bytes.decode("utf-8", errors="ignore")
-        vb = re.search(r'viewBox="([\d.\s-]+)"', text)
-        if vb:
-            parts = vb.group(1).split()
-            if len(parts) == 4:
-                w = max(1, int(float(parts[2])))
-                h = max(1, int(float(parts[3])))
-                return cairosvg.svg2png(bytestring=svg_bytes,
-                                        output_width=w * scale,
-                                        output_height=h * scale)
-        return cairosvg.svg2png(bytestring=svg_bytes, output_width=512, output_height=512)
+    import re
+    text = svg_bytes.decode("utf-8", errors="ignore")
+
+    # Figma uses CSS var() which cairosvg doesn't support — replace with fallback color
+    text = re.sub(r'var\(\s*--[^,)]+,\s*([^)]+)\)', r'\1', text)
+
+    # Determine output dimensions from viewBox (Figma uses width="100%")
+    output_width  = None
+    output_height = None
+    vb = re.search(r'viewBox="([\d.\s-]+)"', text)
+    if vb:
+        parts = vb.group(1).split()
+        if len(parts) == 4:
+            output_width  = max(1, int(float(parts[2]))) * scale
+            output_height = max(1, int(float(parts[3]))) * scale
+
+    kwargs = {"bytestring": text.encode("utf-8")}
+    if output_width and output_height:
+        kwargs["output_width"]  = output_width
+        kwargs["output_height"] = output_height
+    else:
+        kwargs["scale"] = scale
+
+    return cairosvg.svg2png(**kwargs)
 
 
 def upload_image(image_bytes: bytes, filename: str, content_type: str = "") -> tuple[str, str]:
