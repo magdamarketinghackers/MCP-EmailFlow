@@ -486,8 +486,7 @@ def _create_gr_draft(name: str, subject: str, html: str,
 
     payload = {
         "name": name,
-        "type": "broadcast",
-        "status": "draft",
+        "type": "draft",
         "subject": subject,
         "fromField": {"fromFieldId": from_field_id},
         "replyTo":   {"fromFieldId": from_field_id},
@@ -498,7 +497,7 @@ def _create_gr_draft(name: str, subject: str, html: str,
         },
         "flags": ["openrate", "clicktrack"],
         "sendSettings": {
-            "selectedCampaigns": [{"campaignId": campaign_id}],
+            "selectedCampaigns": [campaign_id],
         },
     }
 
