@@ -282,25 +282,38 @@ def _list_gr_files(page: int = 1, per_page: int = 100) -> Dict:
 
 
 def _test_figma_token() -> Dict:
+    """
+    Test the FIGMA_PAT against key endpoints.
+    Note: /v1/me is excluded for Plan (org) access tokens — we skip it.
+    """
     if not FIGMA_PAT:
         return {"error": "FIGMA_PAT not set"}
+    file_key = "LchycCBdOmUOuABklxHXqp"
+    headers  = {"X-Figma-Token": FIGMA_PAT}
+    results  = {"token_prefix": FIGMA_PAT[:10] + "..."}
     try:
-        with httpx.Client(timeout=10) as c:
-            me = c.get("https://api.figma.com/v1/me", headers={"X-Figma-Token": FIGMA_PAT})
-            me_data = me.json() if me.status_code == 200 else {"http_status": me.status_code, "body": me.text}
-            file_check = c.get(
-                f"https://api.figma.com/v1/files/LchycCBdOmUOuABklxHXqp/nodes?ids=923:83&depth=1",
-                headers={"X-Figma-Token": FIGMA_PAT}
+        with httpx.Client(timeout=15) as c:
+            # Test 1: file metadata (works for both PAT and plan tokens)
+            r1 = c.get(f"https://api.figma.com/v1/files/{file_key}?depth=1", headers=headers)
+            results["file_metadata_status"] = r1.status_code
+            if r1.status_code == 200:
+                results["file_name"] = r1.json().get("name")
+
+            # Test 2: image export (the actual endpoint we need)
+            r2 = c.get(
+                f"https://api.figma.com/v1/images/{file_key}?ids=923:83&format=png&scale=1",
+                headers=headers
             )
-        return {
-            "me_status": me.status_code,
-            "me_email": me_data.get("email"),
-            "me_handle": me_data.get("handle"),
-            "file_access_status": file_check.status_code,
-            "token_prefix": FIGMA_PAT[:8] + "...",
-        }
+            results["image_export_status"] = r2.status_code
+            if r2.status_code == 200:
+                results["image_export_ok"] = True
+                data = r2.json()
+                results["sample_url"] = list(data.get("images", {}).values())[:1]
+            else:
+                results["image_export_error"] = r2.text[:300]
     except Exception as e:
-        return {"error": str(e)}
+        results["error"] = str(e)
+    return results
 
 
 def _check_config() -> Dict:
