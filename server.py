@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import time
 import base64
+import cairosvg
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -141,12 +142,29 @@ def gr_upload(image_bytes: bytes, filename: str) -> str:
     return cdn_url
 
 
-def upload_image(image_bytes: bytes, filename: str) -> tuple[str, str]:
+def _is_svg(content: bytes, content_type: str = "") -> bool:
+    if "svg" in content_type.lower():
+        return True
+    head = content[:512].lstrip().lower()
+    return head.startswith(b"<?xml") and b"<svg" in head[:512] or head.startswith(b"<svg")
+
+
+def _svg_to_png(svg_bytes: bytes, scale: int = 4) -> bytes:
+    """Render SVG to PNG. scale upsamples small icons for crisp display."""
+    return cairosvg.svg2png(bytestring=svg_bytes, scale=scale)
+
+
+def upload_image(image_bytes: bytes, filename: str, content_type: str = "") -> tuple[str, str]:
     """
     Upload image to best available CDN.
     Returns (cdn_url, provider) where provider is 'getresponse' or 'cloudinary'.
     Tries GR first; falls back to Cloudinary if GR returns 404.
+    Converts SVG to PNG before upload (GR File Library doesn't accept SVG).
     """
+    if _is_svg(image_bytes, content_type):
+        image_bytes = _svg_to_png(image_bytes)
+        base = filename.rsplit(".", 1)[0]
+        filename = f"{base}.png"
     try:
         url = gr_upload(image_bytes, filename)
         return url, "getresponse"
@@ -269,8 +287,13 @@ def _bulk_upload_urls_to_gr(items: List[Dict]) -> Dict:
                 r.raise_for_status()
                 img = r.content
                 ct  = r.headers.get("content-type", "")
-            ext = "jpg" if "jpeg" in ct else "png"
-            cdn_url, provider = upload_image(img, f"{name}.{ext}")
+            if "svg" in ct.lower() or _is_svg(img, ct):
+                ext = "svg"
+            elif "jpeg" in ct:
+                ext = "jpg"
+            else:
+                ext = "png"
+            cdn_url, provider = upload_image(img, f"{name}.{ext}", content_type=ct)
             uploaded[name] = cdn_url
             logger.info(f"  ✓ {name} via {provider} → {cdn_url}")
         except Exception as e:
@@ -299,10 +322,15 @@ def _upload_url_to_gr(url: str, name: str) -> Dict:
     except Exception as e:
         return {"error": f"Download failed: {e}"}
 
-    ext      = "jpg" if "jpeg" in ct else "png"
+    if "svg" in ct.lower() or _is_svg(img, ct):
+        ext = "svg"
+    elif "jpeg" in ct:
+        ext = "jpg"
+    else:
+        ext = "png"
     filename = f"{name}.{ext}"
     try:
-        cdn_url, provider = upload_image(img, filename)
+        cdn_url, provider = upload_image(img, filename, content_type=ct)
     except Exception as e:
         return {"error": f"Upload failed: {e}"}
 
