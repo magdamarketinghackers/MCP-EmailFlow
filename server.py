@@ -248,6 +248,44 @@ def _bulk_upload_from_figma_to_gr(file_key: str, nodes: List[Dict], scale: int =
     }
 
 
+def _bulk_upload_urls_to_gr(items: List[Dict]) -> Dict:
+    """
+    Bulk upload images from URLs to GR File Library.
+    items: [{url, name}, ...]
+    Returns {uploaded: {name: gr_url}, errors: {name: reason}}.
+    """
+    if not GR_API_KEY:
+        return {"error": "GR_API_KEY env var not configured on Railway"}
+
+    uploaded: Dict[str, str] = {}
+    errors:   Dict[str, str] = {}
+
+    for item in items:
+        url  = item["url"]
+        name = item["name"]
+        try:
+            with httpx.Client(timeout=60, follow_redirects=True) as c:
+                r = c.get(url)
+                r.raise_for_status()
+                img = r.content
+                ct  = r.headers.get("content-type", "")
+            ext = "jpg" if "jpeg" in ct else "png"
+            cdn_url, provider = upload_image(img, f"{name}.{ext}")
+            uploaded[name] = cdn_url
+            logger.info(f"  ✓ {name} via {provider} → {cdn_url}")
+        except Exception as e:
+            errors[name] = str(e)
+            logger.error(f"  ✗ {name}: {e}")
+
+    return {
+        "uploaded": uploaded,
+        "errors":   errors,
+        "total":    len(items),
+        "success":  len(uploaded),
+        "failed":   len(errors),
+    }
+
+
 def _upload_url_to_gr(url: str, name: str) -> Dict:
     """Download any public URL and upload to GR. Useful for logos, icons."""
     if not GR_API_KEY:
@@ -289,7 +327,7 @@ def _test_figma_token() -> Dict:
     if not FIGMA_PAT:
         return {"error": "FIGMA_PAT not set"}
     file_key = "LchycCBdOmUOuABklxHXqp"
-    headers  = {"X-Figma-Token": FIGMA_PAT}
+    headers  = {"X-Figma-Token": FIGMA_PAT, "User-Agent": "Mozilla/5.0"}
     results  = {"token_prefix": FIGMA_PAT[:10] + "..."}
     try:
         with httpx.Client(timeout=15) as c:
@@ -479,6 +517,32 @@ ALL_TOOLS = [
         },
     ),
     Tool(
+        name="bulk_upload_urls_to_gr",
+        description=(
+            "Bulk download images from URLs and upload to GetResponse File Library. "
+            "Most efficient way to push Figma images to GR — Claude fetches Figma design context "
+            "(via Figma MCP/OAuth) and passes the resulting image URLs here."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "List of {url, name} pairs",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "url":  {"type": "string", "description": "Public image URL (e.g. Figma S3 export URL)"},
+                            "name": {"type": "string", "description": "Output filename (no extension)"},
+                        },
+                        "required": ["url", "name"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    ),
+    Tool(
         name="upload_url_to_gr",
         description=(
             "Download any public image URL and upload it to GetResponse Files CDN. "
@@ -586,6 +650,8 @@ def _dispatch(name: str, args: dict) -> Dict[str, Any]:
         )
     if name == "upload_url_to_gr":
         return _upload_url_to_gr(args["url"], args["name"])
+    if name == "bulk_upload_urls_to_gr":
+        return _bulk_upload_urls_to_gr(args["items"])
     if name == "list_gr_files":
         return _list_gr_files(args.get("page", 1), args.get("per_page", 100))
     if name == "check_config":
