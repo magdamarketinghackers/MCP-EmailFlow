@@ -281,6 +281,28 @@ def _list_gr_files(page: int = 1, per_page: int = 100) -> Dict:
         return {"error": str(e)}
 
 
+def _test_figma_token() -> Dict:
+    if not FIGMA_PAT:
+        return {"error": "FIGMA_PAT not set"}
+    try:
+        with httpx.Client(timeout=10) as c:
+            me = c.get("https://api.figma.com/v1/me", headers={"X-Figma-Token": FIGMA_PAT})
+            me_data = me.json() if me.status_code == 200 else {"http_status": me.status_code, "body": me.text}
+            file_check = c.get(
+                f"https://api.figma.com/v1/files/LchycCBdOmUOuABklxHXqp/nodes?ids=923:83&depth=1",
+                headers={"X-Figma-Token": FIGMA_PAT}
+            )
+        return {
+            "me_status": me.status_code,
+            "me_email": me_data.get("email"),
+            "me_handle": me_data.get("handle"),
+            "file_access_status": file_check.status_code,
+            "token_prefix": FIGMA_PAT[:8] + "...",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _check_config() -> Dict:
     cdn = "cloudinary" if CLOUDINARY_URL else "getresponse_files"
     return {
@@ -460,6 +482,11 @@ ALL_TOOLS = [
         },
     ),
     Tool(
+        name="test_figma_token",
+        description="Debug: test if FIGMA_PAT is valid and has access to the Iveresse file.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
         name="check_config",
         description="Check whether FIGMA_PAT and GR_API_KEY are configured on this server.",
         inputSchema={"type": "object", "properties": {}},
@@ -540,6 +567,8 @@ def _dispatch(name: str, args: dict) -> Dict[str, Any]:
         return _list_gr_files(args.get("page", 1), args.get("per_page", 100))
     if name == "check_config":
         return _check_config()
+    if name == "test_figma_token":
+        return _test_figma_token()
     if name == "list_gr_from_fields":
         return _list_gr_from_fields()
     if name == "list_gr_campaigns":
