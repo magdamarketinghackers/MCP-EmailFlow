@@ -131,7 +131,11 @@ def gr_upload(image_bytes: bytes, filename: str) -> str:
             headers={**gr_headers(), "Content-Type": "application/json"},
             json=payload,
         )
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"GR {r.status_code}: {r.text[:500]} (name={name}, ext={ext}, bytes={len(image_bytes)})",
+                request=r.request, response=r
+            )
         data = r.json()
 
     cdn_url = (data.get("url") or data.get("publicUrl") or
