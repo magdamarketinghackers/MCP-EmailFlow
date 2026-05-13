@@ -293,24 +293,34 @@ def _test_figma_token() -> Dict:
     results  = {"token_prefix": FIGMA_PAT[:10] + "..."}
     try:
         with httpx.Client(timeout=15) as c:
-            # Test 1: file metadata (works for both PAT and plan tokens)
-            r1 = c.get(f"https://api.figma.com/v1/files/{file_key}?depth=1", headers=headers)
-            results["file_metadata_status"] = r1.status_code
-            if r1.status_code == 200:
-                results["file_name"] = r1.json().get("name")
+            # Try X-Figma-Token header (standard PAT)
+            r1 = c.get(f"https://api.figma.com/v1/files/{file_key}?depth=1", headers={"X-Figma-Token": FIGMA_PAT})
+            results["x_figma_token_status"] = r1.status_code
 
-            # Test 2: image export (the actual endpoint we need)
-            r2 = c.get(
-                f"https://api.figma.com/v1/images/{file_key}?ids=923:83&format=png&scale=1",
-                headers=headers
+            # Try Authorization: Bearer (OAuth / developer tokens)
+            r2 = c.get(f"https://api.figma.com/v1/files/{file_key}?depth=1",
+                       headers={"Authorization": f"Bearer {FIGMA_PAT}"})
+            results["bearer_status"] = r2.status_code
+
+            if r1.status_code == 200:
+                results["auth_method"] = "X-Figma-Token"
+                results["file_name"] = r1.json().get("name")
+            elif r2.status_code == 200:
+                results["auth_method"] = "Bearer"
+                results["file_name"] = r2.json().get("name")
+
+            # Image export with whichever header worked
+            working_headers = ({"X-Figma-Token": FIGMA_PAT} if r1.status_code == 200
+                               else {"Authorization": f"Bearer {FIGMA_PAT}"})
+            r3 = c.get(
+                f"https://api.figma.com/v1/images/{file_key}?ids=923%3A83&format=png&scale=1",
+                headers=working_headers
             )
-            results["image_export_status"] = r2.status_code
-            if r2.status_code == 200:
+            results["image_export_status"] = r3.status_code
+            if r3.status_code == 200:
                 results["image_export_ok"] = True
-                data = r2.json()
-                results["sample_url"] = list(data.get("images", {}).values())[:1]
             else:
-                results["image_export_error"] = r2.text[:300]
+                results["image_export_error"] = r3.text[:200]
     except Exception as e:
         results["error"] = str(e)
     return results
