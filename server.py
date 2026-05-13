@@ -111,16 +111,24 @@ def gr_headers() -> Dict[str, str]:
 
 def gr_upload(image_bytes: bytes, filename: str) -> str:
     """
-    Uploads an image to GetResponse Files gallery.
+    Uploads an image to GetResponse File Library.
     Returns the public CDN URL.
-    Raises httpx.HTTPStatusError on failure (caller may catch 404 and fall back).
     """
+    name, _, ext = filename.rpartition(".")
+    if not name:
+        name, ext = filename, "png"
+
+    payload = {
+        "name":      name,
+        "extension": ext,
+        "content":   base64.b64encode(image_bytes).decode("ascii"),
+        "folder":    None,
+    }
     with httpx.Client(timeout=120) as c:
         r = c.post(
-            f"{GR_BASE}/files",
-            headers=gr_headers(),
-            files={"content": (filename, image_bytes, _mime(filename))},
-            data={"fileName": filename},
+            f"{GR_BASE}/file-library/files",
+            headers={**gr_headers(), "Content-Type": "application/json"},
+            json=payload,
         )
         r.raise_for_status()
         data = r.json()
@@ -152,11 +160,12 @@ def upload_image(image_bytes: bytes, filename: str) -> tuple[str, str]:
 
 def gr_list(page: int = 1, per_page: int = 100) -> List[Dict]:
     with httpx.Client(timeout=30) as c:
-        r = c.get(f"{GR_BASE}/files",
+        r = c.get(f"{GR_BASE}/file-library/files",
                   headers=gr_headers(),
                   params={"page": page, "perPage": per_page})
         r.raise_for_status()
-    return r.json() if isinstance(r.json(), list) else r.json().get("files", [])
+    data = r.json()
+    return data if isinstance(data, list) else data.get("files", data.get("items", []))
 
 
 # ── Tool implementations ───────────────────────────────────────────────────────
