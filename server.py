@@ -154,8 +154,26 @@ def _is_svg(content: bytes, content_type: str = "") -> bool:
 
 
 def _svg_to_png(svg_bytes: bytes, scale: int = 4) -> bytes:
-    """Render SVG to PNG. scale upsamples small icons for crisp display."""
-    return cairosvg.svg2png(bytestring=svg_bytes, scale=scale)
+    """
+    Render SVG to PNG. scale upsamples small icons for crisp display.
+    Falls back to explicit dimensions when SVG uses % units (Figma exports).
+    """
+    try:
+        return cairosvg.svg2png(bytestring=svg_bytes, scale=scale)
+    except Exception:
+        # Parse viewBox to get intrinsic dimensions (Figma SVGs use width="100%")
+        import re
+        text = svg_bytes.decode("utf-8", errors="ignore")
+        vb = re.search(r'viewBox="([\d.\s-]+)"', text)
+        if vb:
+            parts = vb.group(1).split()
+            if len(parts) == 4:
+                w = max(1, int(float(parts[2])))
+                h = max(1, int(float(parts[3])))
+                return cairosvg.svg2png(bytestring=svg_bytes,
+                                        output_width=w * scale,
+                                        output_height=h * scale)
+        return cairosvg.svg2png(bytestring=svg_bytes, output_width=512, output_height=512)
 
 
 def upload_image(image_bytes: bytes, filename: str, content_type: str = "") -> tuple[str, str]:
