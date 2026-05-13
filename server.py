@@ -422,6 +422,43 @@ def _test_figma_token() -> Dict:
     return results
 
 
+def _list_gr_drafts(page: int = 1, per_page: int = 100, name_filter: Optional[str] = None) -> Dict:
+    if not GR_API_KEY:
+        return {"error": "GR_API_KEY env var not configured on Railway"}
+    try:
+        params = {"page": page, "perPage": per_page, "query[type]": "draft"}
+        if name_filter:
+            params["query[name]"] = name_filter
+        with httpx.Client(timeout=30) as c:
+            r = c.get(f"{GR_BASE}/newsletters", headers=gr_headers(), params=params)
+            r.raise_for_status()
+        drafts = r.json()
+        simplified = [{"newsletterId": d.get("newsletterId"), "name": d.get("name"),
+                       "subject": d.get("subject"), "type": d.get("type")} for d in drafts]
+        return {"drafts": simplified, "count": len(simplified)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _delete_gr_drafts(newsletter_ids: List[str]) -> Dict:
+    if not GR_API_KEY:
+        return {"error": "GR_API_KEY env var not configured on Railway"}
+    deleted: List[str] = []
+    errors:  Dict[str, str] = {}
+    with httpx.Client(timeout=30) as c:
+        for nid in newsletter_ids:
+            try:
+                r = c.delete(f"{GR_BASE}/newsletters/{nid}", headers=gr_headers())
+                if r.status_code in (200, 204):
+                    deleted.append(nid)
+                else:
+                    errors[nid] = f"HTTP {r.status_code}: {r.text[:200]}"
+            except Exception as e:
+                errors[nid] = str(e)
+    return {"deleted": deleted, "errors": errors, "total": len(newsletter_ids),
+            "success": len(deleted), "failed": len(errors)}
+
+
 def _check_config() -> Dict:
     cdn = "cloudinary" if CLOUDINARY_URL else "getresponse_files"
     return {
@@ -626,6 +663,30 @@ ALL_TOOLS = [
         },
     ),
     Tool(
+        name="list_gr_drafts",
+        description="List newsletter drafts in GetResponse. Optional name_filter to narrow results.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name_filter": {"type": "string", "description": "Filter by draft name (substring)"},
+                "page":     {"type": "integer", "default": 1},
+                "per_page": {"type": "integer", "default": 100},
+            },
+        },
+    ),
+    Tool(
+        name="delete_gr_drafts",
+        description="Delete one or more drafts/newsletters by ID.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "newsletter_ids": {"type": "array", "items": {"type": "string"},
+                                   "description": "List of newsletterId values to delete"},
+            },
+            "required": ["newsletter_ids"],
+        },
+    ),
+    Tool(
         name="test_figma_token",
         description="Debug: test if FIGMA_PAT is valid and has access to the Iveresse file.",
         inputSchema={"type": "object", "properties": {}},
@@ -715,6 +776,10 @@ def _dispatch(name: str, args: dict) -> Dict[str, Any]:
         return _check_config()
     if name == "test_figma_token":
         return _test_figma_token()
+    if name == "list_gr_drafts":
+        return _list_gr_drafts(args.get("page", 1), args.get("per_page", 100), args.get("name_filter"))
+    if name == "delete_gr_drafts":
+        return _delete_gr_drafts(args["newsletter_ids"])
     if name == "list_gr_from_fields":
         return _list_gr_from_fields()
     if name == "list_gr_campaigns":
