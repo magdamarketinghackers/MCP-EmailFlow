@@ -4,7 +4,11 @@ MCP server: Figma → GetResponse pipeline for email newsletters. Hosted on Rail
 
 ## Architecture
 
-Claude does Figma extraction via Figma MCP (OAuth — works without server-side PAT).
+Claude does Figma extraction via Figma MCP (OAuth — each user authenticates with their own Figma account).
+This server has NO server-side Figma access — by design. Every team member's claude.ai needs:
+1. Figma integration enabled in their account (claude.ai → Settings → Integrations → Figma)
+2. Their Figma account must be in the team/project that owns the design file
+
 This server only handles: image upload to GR File Library, draft creation in GR.
 
 Same Starlette + SSE stack as the other 8 MCP servers — see `mcp_architecture.md` memory.
@@ -17,7 +21,6 @@ Same Starlette + SSE stack as the other 8 MCP servers — see `mcp_architecture.
 
 **Helpers (rarely needed):**
 - `upload_url_to_gr(url, name)` — single-image variant of bulk
-- `upload_from_figma_to_gr / bulk_upload_from_figma_to_gr` — legacy, use Figma REST API directly (requires FIGMA_PAT; Claude usually goes through Figma MCP instead)
 - `list_gr_from_fields` — only if user wants a different sender
 - `list_gr_campaigns` — only if user wants a different list
 - `list_gr_drafts(name_filter, page, per_page)` — for management
@@ -30,7 +33,6 @@ Required:
 - `GR_API_KEY` — GetResponse API key
 
 Optional:
-- `FIGMA_PAT` — only needed if using legacy `upload_from_figma_to_gr` tools
 - `GR_BASE` — for GetResponse 360 (`https://api3.getresponse360.com/v3`); default is `https://api.getresponse.com/v3`
 - `GR_DEFAULT_FROM_FIELD_ID` — default sender (defaults to `rV7P7` = IVERESSE)
 - `GR_DEFAULT_CAMPAIGN_ID` — default list (defaults to `L9fb4` = Main)
