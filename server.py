@@ -61,8 +61,31 @@ When the user wants to create an email from Figma, follow this exact flow:
    • Width: 640px, font: Jost (already in GR templates)
    • Table-based layout. NO <!DOCTYPE>, <html>, <head>, <body> — GR wraps it.
    • Font-weight: Figma 500 (Medium) → CSS 700 (Bold). Email clients lack Medium variants.
-   • object-fit:cover; object-position:center on photos (Outlook ignores it but Figma export already crops correctly).
-   • DO NOT add {unsubscribe} or unsubscribe link — GR appends automatically.
+     Figma 400 stays 400, Figma 600/700 stay as-is.
+   • UPPERCASE text: when Figma shows text as ALL CAPS (via text-transform or in the design),
+     write the literal uppercase characters in HTML — do NOT use CSS `text-transform: uppercase`.
+     Several email clients (incl. some Outlook versions) ignore text-transform.
+     Example: button label "EXPERIENCE SECOND SKIN" goes into HTML as those exact characters.
+   • Images: use fixed width + height attributes matching Figma. Add
+     `style="object-fit:cover;object-position:center;"` on photos.
+     Figma export crops correctly so Outlook (which ignores object-fit) still looks right.
+   • Buttons: full email width with 8px horizontal padding on the outer cell
+     (so button itself spans 624px). Background color = exact hex from Figma.
+   • DO NOT add {unsubscribe}, [UNSUBSCRIBE] placeholder, or unsubscribe link —
+     GR appends one automatically and shows an error if you include one yourself.
+   • Add target="_blank" to all anchor tags.
+   • Wrap external links from the Figma node — logo → home, hero/CTA → collection page,
+     product photos → product pages, social icons → respective profiles.
+
+   IVERESSE FOOTER PATTERN (apply unless Figma node clearly diverges):
+   • Two info icons in a row: "Szyjemy w Polsce" + "Bezpłatna dostawa".
+     Layout: icon on the LEFT, two lines of text on the RIGHT (icon-text inline, not stacked).
+   • Horizontal padding 8px on the icons row container.
+   • Divider line BELOW the info icons (between icons row and footer links/social).
+     Never put the divider above the icons.
+   • Footer links: Polityka prywatności · Regulamin · Kontakt (centered, 14px, underlined).
+   • Social row: TikTok · Instagram · Facebook (24px PNG icons, 24px gap).
+   • Copyright: © 2026 Iveresse, All Rights Reserved (11px Jost light, centered).
 
 5. CREATE DRAFT via this server:
    Call create_gr_draft with: name (internal), subject, html, preheader.
