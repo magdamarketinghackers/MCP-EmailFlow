@@ -147,9 +147,9 @@ async def dashboard(request):
                                   "<p>Set DATABASE_URL and MASTER_KEY on Railway.</p>"))
     clients = store.list_clients()
     rows = "".join(
-        f'<button class="row" onclick="openClient({jsonlib.dumps(c["slug"])})">'
+        f'<button class="row" data-slug="{_html.escape(c["slug"])}" type="button">'
         f'<span>{_html.escape(c["name"])}</span>'
-        f'<span class="tag">{c["esp_type"]}</span>'
+        f'<span class="tag">{_html.escape(c["esp_type"])}</span>'
         f'</button>'
         for c in clients
     ) or '<div class="empty">No clients yet — add your first below.</div>'
@@ -366,6 +366,11 @@ async function deleteClient() {{
   const r = await fetch('/admin/delete/' + slug, {{ method: 'POST' }});
   if (r.redirected || r.ok) location.href = '/admin';
 }}
+
+document.addEventListener('click', e => {{
+  const row = e.target.closest('button.row[data-slug]');
+  if (row) openClient(row.dataset.slug);
+}});
 
 function editClient() {{
   const c = JSON.parse(document.getElementById('detail').dataset.full);
