@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 KLAVIYO_BASE = "https://a.klaviyo.com/api"
 REVISION = "2024-10-15"
+# Klaviyo API uses the JSON:API spec — mandatory content-type for POST/PATCH/DELETE.
+JSONAPI_MIME = "application/vnd.api+json"
 
 
 class KlaviyoESP(BaseESP):
@@ -37,13 +39,17 @@ class KlaviyoESP(BaseESP):
         self.from_label = from_label
         self._cached_acct_sender: Optional[Dict[str, str]] = None
 
-    def _headers(self) -> Dict[str, str]:
-        return {
+    def _headers(self, write: bool = True) -> Dict[str, str]:
+        """write=True for POST/PATCH/DELETE bodies (uses JSON:API mime type).
+           write=False for GETs (regular json accept is fine)."""
+        h = {
             "Authorization": f"Klaviyo-API-Key {self.api_key}",
             "revision": REVISION,
-            "accept": "application/json",
-            "content-type": "application/json",
+            "accept": JSONAPI_MIME,
         }
+        if write:
+            h["content-type"] = JSONAPI_MIME
+        return h
 
     def _account_sender(self) -> Dict[str, str]:
         """Fetch the account's default sender (from_email + from_label).
@@ -51,7 +57,7 @@ class KlaviyoESP(BaseESP):
         if self._cached_acct_sender is not None:
             return self._cached_acct_sender
         with httpx.Client(timeout=30) as c:
-            r = c.get(f"{KLAVIYO_BASE}/accounts/", headers=self._headers())
+            r = c.get(f"{KLAVIYO_BASE}/accounts/", headers=self._headers(write=False))
             if r.status_code >= 400:
                 raise RuntimeError(f"Klaviyo accounts {r.status_code}: {r.text[:300]}")
             payload = r.json()
@@ -188,7 +194,7 @@ class KlaviyoESP(BaseESP):
 
     def list_audiences(self) -> Dict:
         with httpx.Client(timeout=30) as c:
-            r = c.get(f"{KLAVIYO_BASE}/lists/", headers=self._headers())
+            r = c.get(f"{KLAVIYO_BASE}/lists/", headers=self._headers(write=False))
             r.raise_for_status()
         out = [{"id": l["id"], "name": l.get("attributes", {}).get("name")}
                for l in r.json().get("data", [])]
@@ -197,7 +203,7 @@ class KlaviyoESP(BaseESP):
     def list_drafts(self, name_filter: Optional[str] = None) -> Dict:
         params = {"filter": "equals(messages.channel,'email')"}
         with httpx.Client(timeout=30) as c:
-            r = c.get(f"{KLAVIYO_BASE}/campaigns/", headers=self._headers(), params=params)
+            r = c.get(f"{KLAVIYO_BASE}/campaigns/", headers=self._headers(write=False), params=params)
             r.raise_for_status()
         out = []
         for d in r.json().get("data", []):
@@ -213,7 +219,7 @@ class KlaviyoESP(BaseESP):
         with httpx.Client(timeout=30) as c:
             for cid in ids:
                 try:
-                    r = c.delete(f"{KLAVIYO_BASE}/campaigns/{cid}/", headers=self._headers())
+                    r = c.delete(f"{KLAVIYO_BASE}/campaigns/{cid}/", headers=self._headers(write=False))
                     if r.status_code in (200, 204):
                         deleted.append(cid)
                     else:
