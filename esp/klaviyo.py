@@ -11,12 +11,15 @@ Auth: header  Authorization: Klaviyo-API-Key pk_xxx
       header  revision: <date>   (date-based API versioning)
 """
 import base64
+import json
 import logging
 from typing import Dict, List, Optional
 
 import httpx
 
 from .base import BaseESP
+
+jsonlib_dumps = json.dumps
 
 logger = logging.getLogger(__name__)
 
@@ -118,20 +121,25 @@ class KlaviyoESP(BaseESP):
         try:
             with httpx.Client(timeout=60) as c:
                 # 1. template
-                tpl = c.post(f"{KLAVIYO_BASE}/templates/", headers=self._headers(), json={
-                    "data": {"type": "template", "attributes": {
-                        "name": name, "editor_type": "CODE", "html": html}}})
+                tpl_payload = {"data": {"type": "template", "attributes": {
+                    "name": name, "editor_type": "CODE", "html": html}}}
+                tpl = c.post(f"{KLAVIYO_BASE}/templates/", headers=self._headers(),
+                             json=tpl_payload)
                 if tpl.status_code >= 400:
-                    return {"error": f"Klaviyo template {tpl.status_code}: {tpl.text[:400]}"}
+                    logger.error(f"Klaviyo template {tpl.status_code}: {tpl.text}")
+                    return {"error": f"Klaviyo template {tpl.status_code}: {tpl.text[:1500]}"}
                 template_id = tpl.json()["data"]["id"]
 
-                # 2. campaign (draft) with one email message
+                # 2. campaign (draft) with one email message.
+                # NOTE: channel + label + content sit directly on the message's `attributes`
+                # (flat structure). The OpenAPI 'definition' wrapper applies to omni
+                # revisions; for the stable/non-omni revision Klaviyo expects flat.
                 camp_payload = {"data": {"type": "campaign", "attributes": {
                     "name": name,
                     "audiences": {"included": [audience], "excluded": []},
                     "campaign-messages": {"data": [{
                         "type": "campaign-message",
-                        "attributes": {"definition": {
+                        "attributes": {
                             "channel": "email",
                             "label": name,
                             "content": {
@@ -140,15 +148,17 @@ class KlaviyoESP(BaseESP):
                                 "from_email": sender,
                                 "from_label": from_label or sender,
                             },
-                        }},
+                        },
                     }]},
                 }}}
-                camp = c.post(f"{KLAVIYO_BASE}/campaigns/", headers=self._headers(), json=camp_payload)
+                camp = c.post(f"{KLAVIYO_BASE}/campaigns/", headers=self._headers(),
+                              json=camp_payload)
                 if camp.status_code >= 400:
-                    return {"error": f"Klaviyo campaign {camp.status_code}: {camp.text[:400]}"}
+                    logger.error(f"Klaviyo campaign {camp.status_code}: {camp.text}")
+                    logger.error(f"Payload sent: {jsonlib_dumps(camp_payload)[:1500]}")
+                    return {"error": f"Klaviyo campaign {camp.status_code}: {camp.text[:1500]}"}
                 cdata = camp.json()["data"]
                 campaign_id = cdata["id"]
-                # message id lives in relationships
                 msg_id = (cdata.get("relationships", {}).get("campaign-messages", {})
                           .get("data", [{}])[0].get("id"))
 
@@ -160,8 +170,9 @@ class KlaviyoESP(BaseESP):
                                         "relationships": {"template": {"data": {
                                             "type": "template", "id": template_id}}}}})
                     if assign.status_code >= 400:
+                        logger.error(f"Klaviyo assign-template {assign.status_code}: {assign.text}")
                         return {"error": f"Klaviyo assign-template {assign.status_code}: "
-                                         f"{assign.text[:300]} (campaign {campaign_id} created)"}
+                                         f"{assign.text[:1500]} (campaign {campaign_id} created)"}
 
             return {
                 "id": campaign_id, "name": name, "subject": subject,
