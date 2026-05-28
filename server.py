@@ -25,15 +25,19 @@ logger = logging.getLogger(__name__)
 
 SERVER_INSTRUCTIONS = """
 This server creates email DRAFTS from Figma designs, for MULTIPLE clients.
-Each client is configured with its own ESP (GetResponse or Klaviyo) and API keys,
-managed in the /admin panel. You never see raw API keys — you reference a client by slug.
+Each client can have MULTIPLE ESP connections (e.g. one for GetResponse and one
+for Klaviyo during a migration). Managed in the /admin panel; you never see raw
+API keys, only slugs and connection labels.
 
 ══════════════════════════════════════════════════════════════════════════
 WORKFLOW
 ══════════════════════════════════════════════════════════════════════════
-0. PICK THE CLIENT
-   • Call list_clients to see available clients (slug, name, esp).
-   • If the user didn't say which client, ASK. Every other tool needs `client`.
+0. PICK THE CLIENT (+ optional connection)
+   • Call list_clients — returns slug + connections [{label, esp, is_primary}].
+   • Ask the user which client if not specified.
+   • If a client has MORE THAN ONE connection (e.g. 'getresponse' + 'klaviyo'),
+     ASK which one to use. Otherwise omit `connection` — the primary one is used.
+   • Every other tool takes `client` (required) and `connection` (optional label).
 
 1. ASK USER for anything missing:
    • Figma URL or node-id (must contain fileKey + nodeId)
@@ -89,32 +93,46 @@ session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
 
 # ── client resolution ───────────────────────────────────────────────────────
 
-def _resolve(slug: str):
-    """Return (esp, None) or (None, error_dict)."""
+def _resolve(slug: str, connection: Optional[str] = None):
+    """Return (esp, info_dict, None) or (None, None, error_dict).
+       info_dict carries which client/connection was used (for logging/output)."""
     if not slug:
-        return None, {"error": "Missing 'client'. Call list_clients first."}
+        return None, None, {"error": "Missing 'client'. Call list_clients first."}
     if not store.available():
-        return None, {"error": "Client store not configured (DATABASE_URL / MASTER_KEY missing)."}
-    client = store.get_client(slug)
-    if not client:
-        avail = [c["slug"] for c in store.list_clients()]
-        return None, {"error": f"Unknown client '{slug}'. Available: {avail}"}
+        return None, None, {"error": "Client store not configured (DATABASE_URL / MASTER_KEY missing)."}
+    conn = store.get_connection(slug, connection)
+    if not conn:
+        labels = store.list_connection_labels(slug)
+        if not labels:
+            avail = [c["slug"] for c in store.list_clients()]
+            return None, None, {"error": f"Unknown client '{slug}'. Available: {avail}"}
+        return None, None, {"error": f"Unknown connection '{connection}' for client '{slug}'. "
+                                       f"Available: {labels}"}
     try:
-        return get_esp(client), None
+        return get_esp(conn), {"client": slug, "connection": conn["label"]}, None
     except Exception as e:
-        return None, {"error": f"Failed to init ESP for '{slug}': {e}"}
+        return None, None, {"error": f"Failed to init ESP for '{slug}/{conn['label']}': {e}"}
 
 
 # ── tool implementations ──────────────────────────────────────────────────────
 
 def _list_clients() -> Dict:
-    clients = store.list_clients()
-    return {"clients": [{"slug": c["slug"], "name": c["name"], "esp": c["esp_type"]}
-                        for c in clients], "count": len(clients)}
+    out = []
+    for c in store.list_clients():
+        out.append({
+            "slug": c["slug"],
+            "name": c["name"],
+            "connections": [
+                {"label": cn["label"], "esp": cn["esp_type"], "is_primary": cn["is_primary"]}
+                for cn in c["connections"]
+            ],
+        })
+    return {"clients": out, "count": len(out)}
 
 
-def _bulk_upload_urls(client: str, items: List[Dict]) -> Dict:
-    esp, err = _resolve(client)
+def _bulk_upload_urls(client: str, items: List[Dict],
+                      connection: Optional[str] = None) -> Dict:
+    esp, info, err = _resolve(client, connection)
     if err:
         return err
     uploaded, errors = {}, {}
@@ -124,33 +142,38 @@ def _bulk_upload_urls(client: str, items: List[Dict]) -> Dict:
             img, ext, ct = fetch_and_prepare(item["url"])
             url = esp.upload_image(img, f"{name}.{ext}", content_type=ct)
             uploaded[name] = url
-            logger.info(f"[{client}] ✓ {name} → {url}")
+            logger.info(f"[{client}/{info['connection']}] ✓ {name} → {url}")
         except Exception as e:
             errors[name] = str(e)
-            logger.error(f"[{client}] ✗ {name}: {e}")
-    return {"uploaded": uploaded, "errors": errors, "total": len(items),
+            logger.error(f"[{client}/{info['connection']}] ✗ {name}: {e}")
+    return {"client": client, "connection": info["connection"],
+            "uploaded": uploaded, "errors": errors, "total": len(items),
             "success": len(uploaded), "failed": len(errors)}
 
 
 def _create_draft(client: str, name: str, subject: str, html: str,
                   preheader: Optional[str] = None,
                   sender: Optional[str] = None,
-                  audience: Optional[str] = None) -> Dict:
+                  audience: Optional[str] = None,
+                  connection: Optional[str] = None) -> Dict:
     if not (subject and 2 <= len(subject) <= 128):
         return {"error": f"subject must be 2-128 chars (got {len(subject) if subject else 0})"}
     if not (name and 2 <= len(name) <= 128):
         return {"error": f"name must be 2-128 chars (got {len(name) if name else 0})"}
     if not html or len(html.strip()) < 10:
         return {"error": "html is empty or too short"}
-    esp, err = _resolve(client)
+    esp, info, err = _resolve(client, connection)
     if err:
         return err
-    return esp.create_draft(name, subject, html, preheader=preheader,
-                            sender=sender, audience=audience)
+    result = esp.create_draft(name, subject, html, preheader=preheader,
+                              sender=sender, audience=audience)
+    if isinstance(result, dict):
+        result.setdefault("connection", info["connection"])
+    return result
 
 
-def _list_senders(client: str) -> Dict:
-    esp, err = _resolve(client)
+def _list_senders(client: str, connection: Optional[str] = None) -> Dict:
+    esp, _info, err = _resolve(client, connection)
     if err:
         return err
     try:
@@ -159,8 +182,8 @@ def _list_senders(client: str) -> Dict:
         return {"error": str(e)}
 
 
-def _list_audiences(client: str) -> Dict:
-    esp, err = _resolve(client)
+def _list_audiences(client: str, connection: Optional[str] = None) -> Dict:
+    esp, _info, err = _resolve(client, connection)
     if err:
         return err
     try:
@@ -169,8 +192,9 @@ def _list_audiences(client: str) -> Dict:
         return {"error": str(e)}
 
 
-def _list_drafts(client: str, name_filter: Optional[str] = None) -> Dict:
-    esp, err = _resolve(client)
+def _list_drafts(client: str, name_filter: Optional[str] = None,
+                 connection: Optional[str] = None) -> Dict:
+    esp, _info, err = _resolve(client, connection)
     if err:
         return err
     try:
@@ -179,8 +203,9 @@ def _list_drafts(client: str, name_filter: Optional[str] = None) -> Dict:
         return {"error": str(e)}
 
 
-def _delete_drafts(client: str, ids: List[str]) -> Dict:
-    esp, err = _resolve(client)
+def _delete_drafts(client: str, ids: List[str],
+                   connection: Optional[str] = None) -> Dict:
+    esp, _info, err = _resolve(client, connection)
     if err:
         return err
     try:
@@ -192,6 +217,9 @@ def _delete_drafts(client: str, ids: List[str]) -> Dict:
 # ── MCP tool registry ─────────────────────────────────────────────────────────
 
 _CLIENT_PROP = {"type": "string", "description": "Client slug (from list_clients), e.g. 'iveresse'"}
+_CONN_PROP = {"type": "string",
+              "description": "Optional connection label (e.g. 'getresponse', 'klaviyo'). "
+                             "Omit to use the client's primary connection."}
 
 ALL_TOOLS = [
     Tool(
@@ -208,6 +236,7 @@ ALL_TOOLS = [
             "type": "object",
             "properties": {
                 "client": _CLIENT_PROP,
+                "connection": _CONN_PROP,
                 "items": {
                     "type": "array",
                     "description": "List of {url, name} pairs",
@@ -232,6 +261,7 @@ ALL_TOOLS = [
             "type": "object",
             "properties": {
                 "client": _CLIENT_PROP,
+                "connection": _CONN_PROP,
                 "name": {"type": "string", "description": "Internal draft name (2-128 chars)"},
                 "subject": {"type": "string", "description": "Subject line (2-128 chars)"},
                 "html": {"type": "string", "description": "Full email HTML"},
@@ -245,19 +275,23 @@ ALL_TOOLS = [
     Tool(
         name="list_senders",
         description="List available sender identities for the client's ESP.",
-        inputSchema={"type": "object", "properties": {"client": _CLIENT_PROP}, "required": ["client"]},
+        inputSchema={"type": "object",
+                     "properties": {"client": _CLIENT_PROP, "connection": _CONN_PROP},
+                     "required": ["client"]},
     ),
     Tool(
         name="list_audiences",
         description="List available lists/audiences for the client's ESP.",
-        inputSchema={"type": "object", "properties": {"client": _CLIENT_PROP}, "required": ["client"]},
+        inputSchema={"type": "object",
+                     "properties": {"client": _CLIENT_PROP, "connection": _CONN_PROP},
+                     "required": ["client"]},
     ),
     Tool(
         name="list_drafts",
         description="List existing drafts for the client. Optional name_filter.",
         inputSchema={
             "type": "object",
-            "properties": {"client": _CLIENT_PROP,
+            "properties": {"client": _CLIENT_PROP, "connection": _CONN_PROP,
                            "name_filter": {"type": "string", "description": "Filter by name substring"}},
             "required": ["client"],
         },
@@ -267,7 +301,7 @@ ALL_TOOLS = [
         description="Delete drafts by id for the client.",
         inputSchema={
             "type": "object",
-            "properties": {"client": _CLIENT_PROP,
+            "properties": {"client": _CLIENT_PROP, "connection": _CONN_PROP,
                            "ids": {"type": "array", "items": {"type": "string"},
                                    "description": "Draft IDs to delete"}},
             "required": ["client", "ids"],
@@ -294,27 +328,28 @@ def _dispatch(name: str, args: dict) -> Dict[str, Any]:
     if name == "list_clients":
         return _list_clients()
     if name == "bulk_upload_urls":
-        return _bulk_upload_urls(args["client"], args["items"])
+        return _bulk_upload_urls(args["client"], args["items"], connection=args.get("connection"))
     if name == "create_draft":
         return _create_draft(args["client"], args["name"], args["subject"], args["html"],
                              preheader=args.get("preheader"), sender=args.get("sender"),
-                             audience=args.get("audience"))
+                             audience=args.get("audience"), connection=args.get("connection"))
     if name == "list_senders":
-        return _list_senders(args["client"])
+        return _list_senders(args["client"], connection=args.get("connection"))
     if name == "list_audiences":
-        return _list_audiences(args["client"])
+        return _list_audiences(args["client"], connection=args.get("connection"))
     if name == "list_drafts":
-        return _list_drafts(args["client"], args.get("name_filter"))
+        return _list_drafts(args["client"], args.get("name_filter"),
+                            connection=args.get("connection"))
     if name == "delete_drafts":
-        return _delete_drafts(args["client"], args["ids"])
+        return _delete_drafts(args["client"], args["ids"], connection=args.get("connection"))
     return {"error": f"Unknown tool: {name}"}
 
 
 # ── auto-seed legacy Iveresse on first boot ─────────────────────────────────
 
 def _seed_iveresse():
-    """One-time migration: if the store is empty but the old GR env vars exist,
-    create the 'iveresse' client so the existing setup keeps working."""
+    """One-time seed: if the store is empty but the old GR env vars exist,
+    create an 'iveresse' client with a single 'getresponse' connection."""
     if not store.available():
         return
     try:
@@ -323,14 +358,14 @@ def _seed_iveresse():
         gr_key = os.environ.get("GR_API_KEY", "")
         if not gr_key:
             return
-        store.create_client(
-            slug="iveresse", name="Iveresse", esp_type="getresponse",
+        store.add_connection(
+            slug="iveresse", name="Iveresse", label="getresponse", esp_type="getresponse",
             credentials={"api_key": gr_key,
                          "base": os.environ.get("GR_BASE", "https://api.getresponse.com/v3")},
             defaults={"sender": os.environ.get("GR_DEFAULT_FROM_FIELD_ID", "rV7P7"),
                       "audience": os.environ.get("GR_DEFAULT_CAMPAIGN_ID", "L9fb4")},
         )
-        logger.info("Seeded 'iveresse' client from legacy GR env vars")
+        logger.info("Seeded 'iveresse' client (getresponse connection) from legacy env vars")
     except Exception as e:
         logger.error(f"Seed iveresse failed: {e}")
 
@@ -345,7 +380,9 @@ async def health(request):
 async def dashboard(request):
     clients = store.list_clients() if store.available() else []
     rows = "".join(
-        f'<tr><td>{c["slug"]}</td><td>{c["name"]}</td><td>{c["esp_type"]}</td></tr>'
+        f'<tr><td>{c["slug"]}</td><td>{c["name"]}</td><td>'
+        + ", ".join(f"{cn['label']} ({cn['esp_type']})" for cn in c["connections"])
+        + "</td></tr>"
         for c in clients)
     store_ok = "✅" if store.available() else "❌ DATABASE_URL / MASTER_KEY missing"
     html = f"""<!DOCTYPE html><html><head><title>MCP Email Flow</title>
