@@ -253,9 +253,15 @@ async def dashboard(request):
   <form class="dlg" onsubmit="saveConn(event)">
     <h2>Defaults</h2>
     <div class="desc">Step 2 — pick the default sender and list for this connection</div>
-    <label>Default sender</label>
-    <select id="w2-sender"></select>
-    <input id="w2-sender-text" style="display:none" placeholder="from@example.com">
+    <div id="w2-sender-wrap">
+      <label>Default sender</label>
+      <select id="w2-sender"></select>
+      <input id="w2-sender-text" style="display:none" placeholder="from@example.com">
+    </div>
+    <div id="w2-acct-note" class="card" style="display:none;background:#f0f7f4;border-color:#cfe6dc;margin:12px 0">
+      <div class="body">Sender pobierany automatycznie z konta Klaviyo
+      (<b id="w2-acct-info"></b>) — zmienisz go w Klaviyo → Account → Settings → Contact Information.</div>
+    </div>
     <div id="w2-fl-wrap" style="display:none">
       <label>From label (display name)</label>
       <input id="w2-from-label" placeholder="Brand name">
@@ -387,29 +393,48 @@ async function connect(ev) {{
       label: document.getElementById('w1-label').value.trim(),
       esp_type: payload.esp_type, api_key: payload.api_key, base: payload.base,
       mode, orig_label: document.getElementById('w1-orig-label').value,
+      account_default: !!data.account_default,
     }};
-    populateStep2(data.senders || [], data.audiences || []);
+    populateStep2(data.senders || [], data.audiences || [], !!data.account_default);
     document.getElementById('wiz1').close();
     document.getElementById('wiz2').showModal();
   }} catch (e) {{ err.textContent = 'Network: ' + e.message; }}
   finally {{ btn.disabled = false; btn.textContent = 'Connect →'; }}
 }}
 
-function populateStep2(senders, audiences) {{
+function populateStep2(senders, audiences, accountDefault) {{
+  const wrap = document.getElementById('w2-sender-wrap');
+  const note = document.getElementById('w2-acct-note');
+  const fl = document.getElementById('w2-fl-wrap');
   const ss = document.getElementById('w2-sender');
   const st = document.getElementById('w2-sender-text');
-  const fl = document.getElementById('w2-fl-wrap');
-  if (senders.length === 0) {{
+
+  if (accountDefault) {{
+    // Klaviyo: sender is fixed at account level — hide inputs, show note
+    wrap.style.display = 'none';
+    fl.style.display = 'none';
+    note.style.display = '';
+    const s = senders[0] || {{}};
+    document.getElementById('w2-acct-info').textContent =
+      (s.name || '') + (s.email ? ' <' + s.email + '>' : '');
+  }} else if (senders.length === 0) {{
+    // free-text fallback (e.g. account has no default set yet)
+    wrap.style.display = '';
+    note.style.display = 'none';
     ss.style.display = 'none'; ss.innerHTML = '';
     st.style.display = '';
     fl.style.display = wiz.esp_type === 'klaviyo' ? '' : 'none';
   }} else {{
+    // GR: dropdown with from-fields
+    wrap.style.display = '';
+    note.style.display = 'none';
     ss.style.display = '';
     st.style.display = 'none';
-    fl.style.display = wiz.esp_type === 'klaviyo' ? '' : 'none';
+    fl.style.display = 'none';
     ss.innerHTML = senders.map(s =>
       `<option value="${{s.id}}">${{s.name || s.id}}${{s.email ? ' (' + s.email + ')' : ''}}</option>`).join('');
   }}
+
   const aa = document.getElementById('w2-audience');
   aa.innerHTML = audiences.map(a =>
     `<option value="${{a.id}}">${{a.name || a.id}}</option>`).join('') ||
@@ -424,10 +449,13 @@ function backToStep1() {{
 async function saveConn(ev) {{
   ev.preventDefault();
   const err = document.getElementById('w2-err'); err.textContent = '';
-  const senderSel = document.getElementById('w2-sender');
-  const senderTxt = document.getElementById('w2-sender-text');
-  const sender = senderSel.style.display === 'none' ? senderTxt.value.trim() : senderSel.value;
-  const fl = document.getElementById('w2-from-label').value.trim();
+  let sender = '', fl = '';
+  if (!wiz.account_default) {{
+    const senderSel = document.getElementById('w2-sender');
+    const senderTxt = document.getElementById('w2-sender-text');
+    sender = senderSel.style.display === 'none' ? senderTxt.value.trim() : senderSel.value;
+    fl = document.getElementById('w2-from-label').value.trim();
+  }}
   const body = new URLSearchParams({{
     slug: wiz.slug, name: wiz.name, label: wiz.label, esp_type: wiz.esp_type,
     api_key: wiz.api_key, base: wiz.base,
@@ -450,19 +478,22 @@ async function openClient(slug) {{
   document.getElementById('d-slug').textContent = c.slug;
   const container = document.getElementById('d-connections');
   container.innerHTML = c.connections.map(cn => {{
-    const fl = cn.defaults.from_label ? '· from_label=<b>' + escapeHtml(cn.defaults.from_label) + '</b>' : '';
     const isPrimary = cn.is_primary;
     const primaryTag = isPrimary ? '<span class="tag primary">primary</span>' : '';
     const setPrimaryBtn = isPrimary || c.connections.length === 1
       ? ''
       : `<button type="button" class="btn ghost" onclick="setPrimary('${{escapeAttr(cn.label)}}')">make primary</button>`;
+    const senderTxt = cn.defaults.sender
+      ? '<b>' + escapeHtml(cn.defaults.sender) + '</b>'
+      : (cn.esp_type === 'klaviyo' ? '<i>account default</i>' : '—');
+    const flTxt = cn.defaults.from_label ? '· from_label=<b>' + escapeHtml(cn.defaults.from_label) + '</b>' : '';
     return `<div class="conn-row">
       <div class="meta">
         <b>${{escapeHtml(cn.label)}}</b> <span class="tag">${{escapeHtml(cn.esp_type)}}</span>${{primaryTag}}
         <div class="mask">key=${{escapeHtml(cn.credentials_masked.api_key || '—')}}
-          · sender=<b>${{escapeHtml(cn.defaults.sender || '—')}}</b>
+          · sender=${{senderTxt}}
           · audience=<b>${{escapeHtml(cn.defaults.audience || '—')}}</b>
-          ${{fl}}</div>
+          ${{flTxt}}</div>
       </div>
       <div class="actions">
         ${{setPrimaryBtn}}
@@ -548,6 +579,7 @@ async def test_connection(request):
         "ok": True,
         "senders":   senders_resp.get("senders", []),
         "audiences": audiences_resp.get("audiences", []),
+        "account_default": senders_resp.get("account_default", False),
     })
 
 

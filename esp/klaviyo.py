@@ -30,9 +30,12 @@ class KlaviyoESP(BaseESP):
                  default_audience: Optional[str] = None,
                  from_label: Optional[str] = None):
         self.api_key = api_key
-        self.default_sender = default_sender      # from_email
-        self.default_audience = default_audience  # list id
-        self.from_label = from_label              # display name
+        # default_sender / from_label still accepted as explicit overrides,
+        # but normally we pull from the account itself (see _account_sender).
+        self.default_sender = default_sender
+        self.default_audience = default_audience
+        self.from_label = from_label
+        self._cached_acct_sender: Optional[Dict[str, str]] = None
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -41,6 +44,26 @@ class KlaviyoESP(BaseESP):
             "accept": "application/json",
             "content-type": "application/json",
         }
+
+    def _account_sender(self) -> Dict[str, str]:
+        """Fetch the account's default sender (from_email + from_label).
+           Cached for the lifetime of this ESP instance."""
+        if self._cached_acct_sender is not None:
+            return self._cached_acct_sender
+        with httpx.Client(timeout=30) as c:
+            r = c.get(f"{KLAVIYO_BASE}/accounts/", headers=self._headers())
+            if r.status_code >= 400:
+                raise RuntimeError(f"Klaviyo accounts {r.status_code}: {r.text[:300]}")
+            payload = r.json()
+        rows = payload.get("data", [])
+        if not rows:
+            raise RuntimeError("Klaviyo /accounts returned no rows")
+        ci = rows[0].get("attributes", {}).get("contact_information", {}) or {}
+        self._cached_acct_sender = {
+            "from_email": ci.get("default_sender_email") or "",
+            "from_label": ci.get("default_sender_name") or "",
+        }
+        return self._cached_acct_sender
 
     # ── images ──────────────────────────────────────────────────────────────
     def upload_image(self, image_bytes: bytes, filename: str, content_type: str = "") -> str:
@@ -65,12 +88,26 @@ class KlaviyoESP(BaseESP):
 
     # ── draft ───────────────────────────────────────────────────────────────
     def create_draft(self, name, subject, html, preheader=None, sender=None, audience=None) -> Dict:
-        sender = sender or self.default_sender
         audience = audience or self.default_audience
-        if not sender:
-            return {"error": "No sender (from_email) — set client default or pass sender"}
         if not audience:
             return {"error": "No audience (Klaviyo list id) — set client default or pass audience"}
+
+        # Resolve sender + from_label: explicit > stored default > account default
+        from_label = self.from_label
+        if not sender:
+            sender = self.default_sender
+        if not sender or not from_label:
+            try:
+                acct = self._account_sender()
+            except Exception as e:
+                return {"error": f"Could not fetch Klaviyo account sender: {e}. "
+                                 "Grant 'Accounts: Read Only' scope on the API key, "
+                                 "or pass `sender` explicitly."}
+            sender = sender or acct["from_email"]
+            from_label = from_label or acct["from_label"]
+        if not sender:
+            return {"error": "No sender (from_email) — set it in Klaviyo Account "
+                             "→ Settings → Contact Information or pass `sender` explicitly"}
 
         try:
             with httpx.Client(timeout=60) as c:
@@ -95,7 +132,7 @@ class KlaviyoESP(BaseESP):
                                 "subject": subject,
                                 "preview_text": preheader or "",
                                 "from_email": sender,
-                                "from_label": self.from_label or sender,
+                                "from_label": from_label or sender,
                             },
                         }},
                     }]},
@@ -130,9 +167,24 @@ class KlaviyoESP(BaseESP):
 
     # ── lists ───────────────────────────────────────────────────────────────
     def list_senders(self) -> Dict:
-        # Klaviyo has no senders endpoint — from_email/from_label are set per message.
-        return {"senders": [], "note": "Klaviyo uses from_email/from_label per message; "
-                "set them in client defaults (sender = from_email, from_label = display name)."}
+        """
+        Klaviyo has no multi-sender list — there is one default sender on the account.
+        We return it as a single entry so the wizard can display it (read-only).
+        """
+        try:
+            acct = self._account_sender()
+        except Exception as e:
+            return {"error": str(e)}
+        if not acct["from_email"]:
+            return {"senders": [],
+                    "note": "No default sender on Klaviyo account. "
+                            "Set it in Klaviyo → Account → Settings → Contact Information."}
+        return {"senders": [{
+            "id": acct["from_email"],
+            "email": acct["from_email"],
+            "name": acct["from_label"],
+            "isDefault": True,
+        }], "account_default": True}
 
     def list_audiences(self) -> Dict:
         with httpx.Client(timeout=30) as c:
