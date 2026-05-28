@@ -39,10 +39,12 @@ WORKFLOW
      ASK which one to use. Otherwise omit `connection` — the primary one is used.
    • Every other tool takes `client` (required) and `connection` (optional label).
 
-1. ASK USER for anything missing:
+1. ASK USER — these THREE inputs are REQUIRED for every draft (never guess them):
    • Figma URL or node-id (must contain fileKey + nodeId)
-   • Email subject (max 128 chars)
-   • Preheader / preview text (1-2 sentences)
+   • Email **subject** (max 128 chars) — the line shown in the inbox
+   • **Preheader** / preview text (1-2 sentences shown next to subject)
+   ALWAYS ask for subject and preheader explicitly before calling create_draft,
+   even if you can guess them from the design copy. The user must approve them.
    Sender + audience default to the client config — only ask if user wants to override.
 
 2. FETCH DESIGN via Figma MCP (OAuth — uses the user's own Figma account):
