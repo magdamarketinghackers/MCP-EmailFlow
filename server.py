@@ -2,17 +2,10 @@ import logging
 import os
 import json
 import traceback
-import uvicorn
-import httpx
 import contextlib
-import base64
-import cairosvg
-
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger(__name__)
-
 from typing import Dict, Any, List, Optional
 
+import uvicorn
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse, HTMLResponse
@@ -22,562 +15,262 @@ from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import Tool, TextContent
 
-# ── Config ────────────────────────────────────────────────────────────────────
+import store
+import admin
+from esp import get_esp, SUPPORTED
+from esp.images import fetch_and_prepare
 
-GR_API_KEY               = os.environ.get("GR_API_KEY", "")
-GR_BASE                  = os.environ.get("GR_BASE", "https://api.getresponse.com/v3").rstrip("/")
-GR_DEFAULT_FROM_FIELD_ID = os.environ.get("GR_DEFAULT_FROM_FIELD_ID", "rV7P7")  # IVERESSE
-GR_DEFAULT_CAMPAIGN_ID   = os.environ.get("GR_DEFAULT_CAMPAIGN_ID",   "L9fb4")  # Main
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 SERVER_INSTRUCTIONS = """
-This server creates GetResponse email drafts from Figma designs (Iveresse newsletters).
+This server creates email DRAFTS from Figma designs, for MULTIPLE clients.
+Each client is configured with its own ESP (GetResponse or Klaviyo) and API keys,
+managed in the /admin panel. You never see raw API keys — you reference a client by slug.
 
 ══════════════════════════════════════════════════════════════════════════
 WORKFLOW
 ══════════════════════════════════════════════════════════════════════════
-When the user wants to create an email from Figma, follow this exact flow:
+0. PICK THE CLIENT
+   • Call list_clients to see available clients (slug, name, esp).
+   • If the user didn't say which client, ASK. Every other tool needs `client`.
 
-1. ASK USER for any of these that weren't provided up-front:
+1. ASK USER for anything missing:
    • Figma URL or node-id (must contain fileKey + nodeId)
-   • Email subject (the line shown in inbox, max 128 chars)
-   • Preheader / preview text (1-2 sentences shown next to subject)
+   • Email subject (max 128 chars)
+   • Preheader / preview text (1-2 sentences)
+   Sender + audience default to the client config — only ask if user wants to override.
 
-   Defaults that DON'T need asking unless user overrides them:
-   • Sender (from-field): IVERESSE / shop@iveresse.com (rV7P7)
-   • List (campaign):     Main (L9fb4)
-
-2. FETCH DESIGN via Figma MCP (OAuth — uses the user's Figma account):
+2. FETCH DESIGN via Figma MCP (OAuth — uses the user's own Figma account):
    Call mcp__claude_ai_Figma__get_design_context with fileKey + nodeId.
-   Response includes image URLs like https://www.figma.com/api/mcp/asset/<uuid>
+   If it returns "file not publicly available" / access denied → the user's Figma
+   account lacks access: they must connect Figma in claude.ai → Settings → Integrations,
+   and be a member of the team/project that owns the file. This server has NO
+   server-side Figma access by design.
 
-   If Figma MCP returns "file not publicly available" / "access denied":
-   ➜ The user's Figma account doesn't have access to the file.
-     • Their claude.ai may be missing the Figma integration entirely — they need to
-       go to claude.ai → Settings → Integrations → Figma → Connect.
-     • Their Figma account may not be a member of the team/project that owns the file —
-       file owner must share the file or add them to the team in figma.com.
-   Do NOT attempt to fall back to a Figma PAT — this server intentionally has no
-   server-side Figma access. Every user authenticates with their own Figma OAuth.
-
-3. UPLOAD IMAGES via this server:
-   Call bulk_upload_urls_to_gr with items=[{url, name}, ...]
-   Returns permanent GR CDN URLs (https://us-ms.gr-cdn.com/getresponse-*/photos/*.png).
-   SVG icons are auto-converted to PNG at 4x scale (Figma's CSS var() is handled).
+3. UPLOAD IMAGES:
+   Call bulk_upload_urls(client, items=[{url, name}, ...]).
+   Returns hosted CDN URLs (GR File Library or Klaviyo images). SVG auto-converted to PNG.
 
 4. GENERATE HTML matching the Figma design 1:1:
-   • Width: 640px, font: Jost (already in GR templates)
-   • Table-based layout. NO <!DOCTYPE>, <html>, <head>, <body> — GR wraps it.
-   • Font-weight: Figma 500 (Medium) → CSS 700 (Bold). Email clients lack Medium variants.
-     Figma 400 stays 400, Figma 600/700 stay as-is.
-   • UPPERCASE text: when Figma shows text as ALL CAPS (via text-transform or in the design),
-     write the literal uppercase characters in HTML — do NOT use CSS `text-transform: uppercase`.
-     Several email clients (incl. some Outlook versions) ignore text-transform.
-     Example: button label "EXPERIENCE SECOND SKIN" goes into HTML as those exact characters.
-   • Images: use fixed width + height attributes matching Figma. Add
-     `style="object-fit:cover;object-position:center;"` on photos.
-     Figma export crops correctly so Outlook (which ignores object-fit) still looks right.
-   • Buttons: full email width with 8px horizontal padding on the outer cell
-     (so button itself spans 624px). Background color = exact hex from Figma.
-   • DO NOT add {unsubscribe}, [UNSUBSCRIBE] placeholder, or unsubscribe link —
-     GR appends one automatically and shows an error if you include one yourself.
-   • Add target="_blank" to all anchor tags.
-   • Wrap external links from the Figma node — logo → home, hero/CTA → collection page,
-     product photos → product pages, social icons → respective profiles.
+   • Width 640px, font Jost. Table-based. NO <!DOCTYPE>/<html>/<head>/<body>.
+   • Font-weight: Figma 500 (Medium) → CSS 700 (Bold). 400 stays 400; 600/700 unchanged.
+   • UPPERCASE text: write literal CAPS in HTML, never CSS text-transform:uppercase
+     (several clients incl. some Outlook ignore it).
+   • Photos: fixed width+height attrs + style="object-fit:cover;object-position:center;".
+   • Buttons: full email width minus 8px horizontal padding on the outer cell.
+     Background = exact hex from Figma.
+   • DO NOT add {unsubscribe}/[UNSUBSCRIBE]/unsubscribe link — the ESP appends it.
+   • target="_blank" on all anchors; wrap links from the Figma node (logo→home,
+     CTA→collection, product photos→product pages, social→profiles).
 
-   IVERESSE FOOTER PATTERN (apply unless Figma node clearly diverges):
-   • Two info icons in a row: "Szyjemy w Polsce" + "Bezpłatna dostawa".
-     Layout: icon on the LEFT, two lines of text on the RIGHT (icon-text inline, not stacked).
-   • Horizontal padding 8px on the icons row container.
-   • Divider line BELOW the info icons (between icons row and footer links/social).
-     Never put the divider above the icons.
+   IVERESSE FOOTER PATTERN (apply for iveresse unless the node clearly diverges):
+   • Two info icons in a row: "Szyjemy w Polsce" + "Bezpłatna dostawa",
+     icon LEFT, two text lines RIGHT. 8px horizontal padding on the row.
+   • Divider line BELOW the icons (never above).
    • Footer links: Polityka prywatności · Regulamin · Kontakt (centered, 14px, underlined).
-   • Social row: TikTok · Instagram · Facebook (24px PNG icons, 24px gap).
-   • Copyright: © 2026 Iveresse, All Rights Reserved (11px Jost light, centered).
+   • Social: TikTok · Instagram · Facebook (24px icons, 24px gap).
+   • © 2026 Iveresse, All Rights Reserved (11px Jost light, centered).
 
-5. CREATE DRAFT via this server:
-   Call create_gr_draft with: name (internal), subject, html, preheader.
-   from_field_id and campaign_id are optional — defaults are applied.
-
-══════════════════════════════════════════════════════════════════════════
-KEY TOOLS
-══════════════════════════════════════════════════════════════════════════
-• bulk_upload_urls_to_gr — main image upload (auto SVG→PNG, GR File Library)
-• create_gr_draft        — final step, creates editable draft in GR
-• list_gr_from_fields    — only call if user wants different sender
-• list_gr_campaigns      — only call if user wants different list
-• list_gr_drafts         — for management/cleanup
-• delete_gr_drafts       — bulk delete by IDs
+5. CREATE DRAFT:
+   Call create_draft(client, name, subject, html, preheader).
+   sender/audience optional — client defaults apply.
 
 ══════════════════════════════════════════════════════════════════════════
-NOTES
+TOOLS (all except list_clients take `client`)
 ══════════════════════════════════════════════════════════════════════════
-• GR File Library doesn't accept SVG — server converts to PNG transparently.
-• If user gives just a Figma URL, parse fileKey from /design/<fileKey>/ and nodeId from ?node-id=<X-Y>.
-• Don't double-upload same images — if user runs the flow twice for tweaks, reuse URLs from prior bulk_upload_urls_to_gr response.
+• list_clients · bulk_upload_urls · create_draft
+• list_senders · list_audiences · list_drafts · delete_drafts
 """
 
-server          = Server("email-flow", instructions=SERVER_INSTRUCTIONS)
+server = Server("email-flow", instructions=SERVER_INSTRUCTIONS)
 session_manager = StreamableHTTPSessionManager(app=server, stateless=True)
 
 
-# ── GetResponse Files helpers ──────────────────────────────────────────────────
+# ── client resolution ───────────────────────────────────────────────────────
 
-def gr_headers() -> Dict[str, str]:
-    return {"X-Auth-Token": f"api-key {GR_API_KEY}"}
-
-
-def gr_upload(image_bytes: bytes, filename: str) -> str:
-    """
-    Uploads an image to GetResponse File Library.
-    Returns the public CDN URL.
-    """
-    name, _, ext = filename.rpartition(".")
-    if not name:
-        name, ext = filename, "png"
-
-    payload = {
-        "name":      name,
-        "extension": ext,
-        "content":   base64.b64encode(image_bytes).decode("ascii"),
-        "folder":    None,
-    }
-    with httpx.Client(timeout=120) as c:
-        r = c.post(
-            f"{GR_BASE}/file-library/files",
-            headers={**gr_headers(), "Content-Type": "application/json"},
-            json=payload,
-        )
-        if r.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                f"GR {r.status_code}: {r.text[:500]} (name={name}, ext={ext}, bytes={len(image_bytes)})",
-                request=r.request, response=r
-            )
-        data = r.json()
-
-    cdn_url = (data.get("url") or data.get("publicUrl") or
-               data.get("fileUrl") or data.get("src") or
-               (data.get("file") or {}).get("url"))
-    if not cdn_url:
-        raise ValueError(f"GR upload succeeded but no URL in response: {json.dumps(data)}")
-    return cdn_url
+def _resolve(slug: str):
+    """Return (esp, None) or (None, error_dict)."""
+    if not slug:
+        return None, {"error": "Missing 'client'. Call list_clients first."}
+    if not store.available():
+        return None, {"error": "Client store not configured (DATABASE_URL / MASTER_KEY missing)."}
+    client = store.get_client(slug)
+    if not client:
+        avail = [c["slug"] for c in store.list_clients()]
+        return None, {"error": f"Unknown client '{slug}'. Available: {avail}"}
+    try:
+        return get_esp(client), None
+    except Exception as e:
+        return None, {"error": f"Failed to init ESP for '{slug}': {e}"}
 
 
-def _is_svg(content: bytes, content_type: str = "") -> bool:
-    if "svg" in content_type.lower():
-        return True
-    head = content[:512].lstrip().lower()
-    return head.startswith(b"<?xml") and b"<svg" in head[:512] or head.startswith(b"<svg")
+# ── tool implementations ──────────────────────────────────────────────────────
+
+def _list_clients() -> Dict:
+    clients = store.list_clients()
+    return {"clients": [{"slug": c["slug"], "name": c["name"], "esp": c["esp_type"]}
+                        for c in clients], "count": len(clients)}
 
 
-def _svg_to_png(svg_bytes: bytes, scale: int = 4) -> bytes:
-    """
-    Render SVG to PNG. scale upsamples small icons for crisp display.
-    Preprocesses Figma-specific SVG quirks (CSS var(), % dimensions).
-    """
-    import re
-    text = svg_bytes.decode("utf-8", errors="ignore")
-
-    # Figma uses CSS var() which cairosvg doesn't support — replace with fallback color
-    text = re.sub(r'var\(\s*--[^,)]+,\s*([^)]+)\)', r'\1', text)
-
-    # Determine output dimensions from viewBox (Figma uses width="100%")
-    output_width  = None
-    output_height = None
-    vb = re.search(r'viewBox="([\d.\s-]+)"', text)
-    if vb:
-        parts = vb.group(1).split()
-        if len(parts) == 4:
-            output_width  = max(1, int(float(parts[2]))) * scale
-            output_height = max(1, int(float(parts[3]))) * scale
-
-    kwargs = {"bytestring": text.encode("utf-8")}
-    if output_width and output_height:
-        kwargs["output_width"]  = output_width
-        kwargs["output_height"] = output_height
-    else:
-        kwargs["scale"] = scale
-
-    return cairosvg.svg2png(**kwargs)
-
-
-def upload_image(image_bytes: bytes, filename: str, content_type: str = "") -> str:
-    """
-    Upload image to GR File Library.
-    Auto-converts SVG to PNG (GR doesn't accept SVG).
-    Returns the GR CDN URL.
-    """
-    if _is_svg(image_bytes, content_type):
-        image_bytes = _svg_to_png(image_bytes)
-        base = filename.rsplit(".", 1)[0]
-        filename = f"{base}.png"
-    return gr_upload(image_bytes, filename)
-
-
-def gr_list(page: int = 1, per_page: int = 100) -> List[Dict]:
-    with httpx.Client(timeout=30) as c:
-        r = c.get(f"{GR_BASE}/file-library/files",
-                  headers=gr_headers(),
-                  params={"page": page, "perPage": per_page})
-        r.raise_for_status()
-    data = r.json()
-    return data if isinstance(data, list) else data.get("files", data.get("items", []))
-
-
-# ── Tool implementations ───────────────────────────────────────────────────────
-
-def _bulk_upload_urls_to_gr(items: List[Dict]) -> Dict:
-    """
-    Bulk upload images from URLs to GR File Library.
-    items: [{url, name}, ...]
-    Returns {uploaded: {name: gr_url}, errors: {name: reason}}.
-    """
-    if not GR_API_KEY:
-        return {"error": "GR_API_KEY env var not configured on Railway"}
-
-    uploaded: Dict[str, str] = {}
-    errors:   Dict[str, str] = {}
-
+def _bulk_upload_urls(client: str, items: List[Dict]) -> Dict:
+    esp, err = _resolve(client)
+    if err:
+        return err
+    uploaded, errors = {}, {}
     for item in items:
-        url  = item["url"]
         name = item["name"]
         try:
-            with httpx.Client(timeout=60, follow_redirects=True) as c:
-                r = c.get(url)
-                r.raise_for_status()
-                img = r.content
-                ct  = r.headers.get("content-type", "")
-            if "svg" in ct.lower() or _is_svg(img, ct):
-                ext = "svg"
-            elif "jpeg" in ct:
-                ext = "jpg"
-            else:
-                ext = "png"
-            cdn_url = upload_image(img, f"{name}.{ext}", content_type=ct)
-            uploaded[name] = cdn_url
-            logger.info(f"  ✓ {name} → {cdn_url}")
+            img, ext, ct = fetch_and_prepare(item["url"])
+            url = esp.upload_image(img, f"{name}.{ext}", content_type=ct)
+            uploaded[name] = url
+            logger.info(f"[{client}] ✓ {name} → {url}")
         except Exception as e:
             errors[name] = str(e)
-            logger.error(f"  ✗ {name}: {e}")
-
-    return {
-        "uploaded": uploaded,
-        "errors":   errors,
-        "total":    len(items),
-        "success":  len(uploaded),
-        "failed":   len(errors),
-    }
+            logger.error(f"[{client}] ✗ {name}: {e}")
+    return {"uploaded": uploaded, "errors": errors, "total": len(items),
+            "success": len(uploaded), "failed": len(errors)}
 
 
-def _upload_url_to_gr(url: str, name: str) -> Dict:
-    """Download any public URL and upload to GR. Useful for logos, icons."""
-    if not GR_API_KEY:
-        return {"error": "GR_API_KEY env var not configured on Railway"}
-    try:
-        with httpx.Client(timeout=60, follow_redirects=True) as c:
-            r = c.get(url)
-            r.raise_for_status()
-            img = r.content
-            ct  = r.headers.get("content-type", "")
-    except Exception as e:
-        return {"error": f"Download failed: {e}"}
-
-    if "svg" in ct.lower() or _is_svg(img, ct):
-        ext = "svg"
-    elif "jpeg" in ct:
-        ext = "jpg"
-    else:
-        ext = "png"
-    filename = f"{name}.{ext}"
-    try:
-        cdn_url = upload_image(img, filename, content_type=ct)
-    except Exception as e:
-        return {"error": f"Upload failed: {e}"}
-
-    return {"cdn_url": cdn_url, "name": name, "filename": filename}
-
-
-def _list_gr_files(page: int = 1, per_page: int = 100) -> Dict:
-    if not GR_API_KEY:
-        return {"error": "GR_API_KEY env var not configured on Railway"}
-    try:
-        files = gr_list(page, per_page)
-        return {"files": files, "count": len(files), "page": page}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _list_gr_drafts(page: int = 1, per_page: int = 100, name_filter: Optional[str] = None) -> Dict:
-    if not GR_API_KEY:
-        return {"error": "GR_API_KEY env var not configured on Railway"}
-    try:
-        params = {"page": page, "perPage": per_page, "query[type]": "draft"}
-        if name_filter:
-            params["query[name]"] = name_filter
-        with httpx.Client(timeout=30) as c:
-            r = c.get(f"{GR_BASE}/newsletters", headers=gr_headers(), params=params)
-            r.raise_for_status()
-        drafts = r.json()
-        simplified = [{"newsletterId": d.get("newsletterId"), "name": d.get("name"),
-                       "subject": d.get("subject"), "type": d.get("type")} for d in drafts]
-        return {"drafts": simplified, "count": len(simplified)}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _delete_gr_drafts(newsletter_ids: List[str]) -> Dict:
-    if not GR_API_KEY:
-        return {"error": "GR_API_KEY env var not configured on Railway"}
-    deleted: List[str] = []
-    errors:  Dict[str, str] = {}
-    with httpx.Client(timeout=30) as c:
-        for nid in newsletter_ids:
-            try:
-                r = c.delete(f"{GR_BASE}/newsletters/{nid}", headers=gr_headers())
-                if r.status_code in (200, 204):
-                    deleted.append(nid)
-                else:
-                    errors[nid] = f"HTTP {r.status_code}: {r.text[:200]}"
-            except Exception as e:
-                errors[nid] = str(e)
-    return {"deleted": deleted, "errors": errors, "total": len(newsletter_ids),
-            "success": len(deleted), "failed": len(errors)}
-
-
-def _check_config() -> Dict:
-    return {
-        "gr_api_key_set":           bool(GR_API_KEY),
-        "gr_base":                  GR_BASE,
-        "default_from_field_id":    GR_DEFAULT_FROM_FIELD_ID,
-        "default_campaign_id":      GR_DEFAULT_CAMPAIGN_ID,
-        "status": "ok" if GR_API_KEY else "missing_credentials",
-    }
-
-
-def _list_gr_from_fields() -> Dict:
-    if not GR_API_KEY:
-        return {"error": "GR_API_KEY env var not configured on Railway"}
-    try:
-        with httpx.Client(timeout=30) as c:
-            r = c.get(f"{GR_BASE}/from-fields", headers=gr_headers())
-            r.raise_for_status()
-        fields = r.json()
-        return {"from_fields": fields, "count": len(fields)}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _list_gr_campaigns(page: int = 1, per_page: int = 100) -> Dict:
-    if not GR_API_KEY:
-        return {"error": "GR_API_KEY env var not configured on Railway"}
-    try:
-        with httpx.Client(timeout=30) as c:
-            r = c.get(f"{GR_BASE}/campaigns", headers=gr_headers(),
-                      params={"page": page, "perPage": per_page})
-            r.raise_for_status()
-        campaigns = r.json()
-        if isinstance(campaigns, dict):
-            campaigns = campaigns.get("campaigns", [])
-        simplified = [{"campaignId": c.get("campaignId"), "name": c.get("name"),
-                       "languageCode": c.get("languageCode")} for c in campaigns]
-        return {"campaigns": simplified, "count": len(simplified)}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _create_gr_draft(name: str, subject: str, html: str,
-                     from_field_id: Optional[str] = None,
-                     campaign_id:   Optional[str] = None,
-                     preheader:     Optional[str] = None) -> Dict:
-    if not GR_API_KEY:
-        return {"error": "GR_API_KEY env var not configured on Railway"}
-
-    from_field_id = from_field_id or GR_DEFAULT_FROM_FIELD_ID
-    campaign_id   = campaign_id   or GR_DEFAULT_CAMPAIGN_ID
-
+def _create_draft(client: str, name: str, subject: str, html: str,
+                  preheader: Optional[str] = None,
+                  sender: Optional[str] = None,
+                  audience: Optional[str] = None) -> Dict:
     if not (subject and 2 <= len(subject) <= 128):
         return {"error": f"subject must be 2-128 chars (got {len(subject) if subject else 0})"}
     if not (name and 2 <= len(name) <= 128):
         return {"error": f"name must be 2-128 chars (got {len(name) if name else 0})"}
     if not html or len(html.strip()) < 10:
         return {"error": "html is empty or too short"}
+    esp, err = _resolve(client)
+    if err:
+        return err
+    return esp.create_draft(name, subject, html, preheader=preheader,
+                            sender=sender, audience=audience)
 
-    # Inject preheader as hidden span before body content if provided
-    if preheader:
-        preheader_span = (
-            f'<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">'
-            f'{preheader}'
-            f'</div>'
-        )
-        # Insert after first <table or at the very beginning if no table found
-        if "<table" in html:
-            html = html.replace("<table", preheader_span + "<table", 1)
-        else:
-            html = preheader_span + html
 
-    payload = {
-        "name": name,
-        "type": "draft",
-        "subject": subject,
-        "fromField": {"fromFieldId": from_field_id},
-        "replyTo":   {"fromFieldId": from_field_id},
-        "campaign":  {"campaignId": campaign_id},
-        "content": {
-            "html":  html,
-            "plain": "",
-        },
-        "flags": ["openrate", "clicktrack"],
-        "sendSettings": {
-            "selectedCampaigns": [campaign_id],
-        },
-    }
-
+def _list_senders(client: str) -> Dict:
+    esp, err = _resolve(client)
+    if err:
+        return err
     try:
-        with httpx.Client(timeout=60) as c:
-            r = c.post(f"{GR_BASE}/newsletters", headers={
-                **gr_headers(), "Content-Type": "application/json"
-            }, json=payload)
-            r.raise_for_status()
-        data = r.json()
-        newsletter_id = data.get("newsletterId") or data.get("id")
-        logger.info(f"Draft created: {newsletter_id} — '{name}'")
-        return {
-            "newsletterId": newsletter_id,
-            "name": name,
-            "subject": subject,
-            "status": data.get("status", "draft"),
-            "href": data.get("href"),
-        }
-    except httpx.HTTPStatusError as e:
-        return {"error": f"GR API error {e.response.status_code}: {e.response.text}"}
+        return esp.list_senders()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _list_audiences(client: str) -> Dict:
+    esp, err = _resolve(client)
+    if err:
+        return err
+    try:
+        return esp.list_audiences()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _list_drafts(client: str, name_filter: Optional[str] = None) -> Dict:
+    esp, err = _resolve(client)
+    if err:
+        return err
+    try:
+        return esp.list_drafts(name_filter=name_filter)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _delete_drafts(client: str, ids: List[str]) -> Dict:
+    esp, err = _resolve(client)
+    if err:
+        return err
+    try:
+        return esp.delete_drafts(ids)
     except Exception as e:
         return {"error": str(e)}
 
 
 # ── MCP tool registry ─────────────────────────────────────────────────────────
 
+_CLIENT_PROP = {"type": "string", "description": "Client slug (from list_clients), e.g. 'iveresse'"}
+
 ALL_TOOLS = [
     Tool(
-        name="bulk_upload_urls_to_gr",
-        description=(
-            "Bulk download images from URLs and upload to GetResponse File Library. "
-            "Most efficient way to push Figma images to GR — Claude fetches Figma design context "
-            "(via Figma MCP/OAuth) and passes the resulting image URLs here."
-        ),
+        name="list_clients",
+        description="List configured clients (slug, name, ESP). Call first to know which client to use.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="bulk_upload_urls",
+        description=("Download images from URLs and upload to the client's ESP (GR File Library "
+                     "or Klaviyo images). Pass Figma asset URLs from get_design_context. "
+                     "SVG auto-converted to PNG. Returns name → hosted CDN URL."),
         inputSchema={
             "type": "object",
             "properties": {
+                "client": _CLIENT_PROP,
                 "items": {
                     "type": "array",
                     "description": "List of {url, name} pairs",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "url":  {"type": "string", "description": "Public image URL (e.g. Figma S3 export URL)"},
+                            "url": {"type": "string", "description": "Public image URL"},
                             "name": {"type": "string", "description": "Output filename (no extension)"},
                         },
                         "required": ["url", "name"],
                     },
                 },
             },
-            "required": ["items"],
+            "required": ["client", "items"],
         },
     ),
     Tool(
-        name="upload_url_to_gr",
-        description=(
-            "Download any public image URL and upload it to GetResponse Files CDN. "
-            "Useful for uploading icons, logos, or images from other sources."
-        ),
+        name="create_draft",
+        description=("Create an email draft for the client (GetResponse newsletter draft or "
+                     "Klaviyo campaign draft). sender/audience default to the client config."),
         inputSchema={
             "type": "object",
             "properties": {
-                "url":  {"type": "string", "description": "Public image URL to download"},
-                "name": {"type": "string", "description": "Output filename (without extension)"},
+                "client": _CLIENT_PROP,
+                "name": {"type": "string", "description": "Internal draft name (2-128 chars)"},
+                "subject": {"type": "string", "description": "Subject line (2-128 chars)"},
+                "html": {"type": "string", "description": "Full email HTML"},
+                "preheader": {"type": "string", "description": "Preview text (recommended)"},
+                "sender": {"type": "string", "description": "Optional. Override default sender."},
+                "audience": {"type": "string", "description": "Optional. Override default list/audience."},
             },
-            "required": ["url", "name"],
+            "required": ["client", "name", "subject", "html"],
         },
     ),
     Tool(
-        name="list_gr_files",
-        description="List files already uploaded to GetResponse Files gallery.",
+        name="list_senders",
+        description="List available sender identities for the client's ESP.",
+        inputSchema={"type": "object", "properties": {"client": _CLIENT_PROP}, "required": ["client"]},
+    ),
+    Tool(
+        name="list_audiences",
+        description="List available lists/audiences for the client's ESP.",
+        inputSchema={"type": "object", "properties": {"client": _CLIENT_PROP}, "required": ["client"]},
+    ),
+    Tool(
+        name="list_drafts",
+        description="List existing drafts for the client. Optional name_filter.",
         inputSchema={
             "type": "object",
-            "properties": {
-                "page":     {"type": "integer", "description": "Page number (default 1)", "default": 1},
-                "per_page": {"type": "integer", "description": "Results per page (default 100)", "default": 100},
-            },
+            "properties": {"client": _CLIENT_PROP,
+                           "name_filter": {"type": "string", "description": "Filter by name substring"}},
+            "required": ["client"],
         },
     ),
     Tool(
-        name="list_gr_drafts",
-        description="List newsletter drafts in GetResponse. Optional name_filter to narrow results.",
+        name="delete_drafts",
+        description="Delete drafts by id for the client.",
         inputSchema={
             "type": "object",
-            "properties": {
-                "name_filter": {"type": "string", "description": "Filter by draft name (substring)"},
-                "page":     {"type": "integer", "default": 1},
-                "per_page": {"type": "integer", "default": 100},
-            },
-        },
-    ),
-    Tool(
-        name="delete_gr_drafts",
-        description="Delete one or more drafts/newsletters by ID.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "newsletter_ids": {"type": "array", "items": {"type": "string"},
-                                   "description": "List of newsletterId values to delete"},
-            },
-            "required": ["newsletter_ids"],
-        },
-    ),
-    Tool(
-        name="check_config",
-        description="Check server configuration (GR API key, defaults).",
-        inputSchema={"type": "object", "properties": {}},
-    ),
-    Tool(
-        name="list_gr_from_fields",
-        description=(
-            "List available sender (From) addresses configured in GetResponse. "
-            "Returns fromFieldId and email for each. Required before calling create_gr_draft."
-        ),
-        inputSchema={"type": "object", "properties": {}},
-    ),
-    Tool(
-        name="list_gr_campaigns",
-        description=(
-            "List subscriber lists (campaigns) in GetResponse. "
-            "Returns campaignId and name. Required before calling create_gr_draft."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "page":     {"type": "integer", "description": "Page number (default 1)", "default": 1},
-                "per_page": {"type": "integer", "description": "Results per page (default 100)", "default": 100},
-            },
-        },
-    ),
-    Tool(
-        name="create_gr_draft",
-        description=(
-            "Create a newsletter draft in GetResponse with the provided HTML. "
-            "The draft appears in GetResponse → Newsletters → Drafts and is ready to schedule or send. "
-            "from_field_id and campaign_id default to IVERESSE sender and Main list — "
-            "only override if user requests a different sender/list."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "name":           {"type": "string", "description": "Internal newsletter name (visible only in GR dashboard, 2-128 chars)"},
-                "subject":        {"type": "string", "description": "Email subject line shown to recipients (2-128 chars)"},
-                "html":           {"type": "string", "description": "Full HTML content of the email"},
-                "preheader":      {"type": "string", "description": "Preview text shown next to subject in inbox (recommended)"},
-                "from_field_id":  {"type": "string", "description": "Optional. fromFieldId from list_gr_from_fields. Defaults to IVERESSE."},
-                "campaign_id":    {"type": "string", "description": "Optional. campaignId from list_gr_campaigns. Defaults to Main list."},
-            },
-            "required": ["name", "subject", "html"],
+            "properties": {"client": _CLIENT_PROP,
+                           "ids": {"type": "array", "items": {"type": "string"},
+                                   "description": "Draft IDs to delete"}},
+            "required": ["client", "ids"],
         },
     ),
 ]
@@ -598,81 +291,97 @@ async def call_tool(name: str, arguments: dict):
 
 
 def _dispatch(name: str, args: dict) -> Dict[str, Any]:
-    if name == "upload_url_to_gr":
-        return _upload_url_to_gr(args["url"], args["name"])
-    if name == "bulk_upload_urls_to_gr":
-        return _bulk_upload_urls_to_gr(args["items"])
-    if name == "list_gr_files":
-        return _list_gr_files(args.get("page", 1), args.get("per_page", 100))
-    if name == "check_config":
-        return _check_config()
-    if name == "list_gr_drafts":
-        return _list_gr_drafts(args.get("page", 1), args.get("per_page", 100), args.get("name_filter"))
-    if name == "delete_gr_drafts":
-        return _delete_gr_drafts(args["newsletter_ids"])
-    if name == "list_gr_from_fields":
-        return _list_gr_from_fields()
-    if name == "list_gr_campaigns":
-        return _list_gr_campaigns(args.get("page", 1), args.get("per_page", 100))
-    if name == "create_gr_draft":
-        return _create_gr_draft(
-            args["name"], args["subject"], args["html"],
-            from_field_id=args.get("from_field_id"),
-            campaign_id=args.get("campaign_id"),
-            preheader=args.get("preheader"),
-        )
+    if name == "list_clients":
+        return _list_clients()
+    if name == "bulk_upload_urls":
+        return _bulk_upload_urls(args["client"], args["items"])
+    if name == "create_draft":
+        return _create_draft(args["client"], args["name"], args["subject"], args["html"],
+                             preheader=args.get("preheader"), sender=args.get("sender"),
+                             audience=args.get("audience"))
+    if name == "list_senders":
+        return _list_senders(args["client"])
+    if name == "list_audiences":
+        return _list_audiences(args["client"])
+    if name == "list_drafts":
+        return _list_drafts(args["client"], args.get("name_filter"))
+    if name == "delete_drafts":
+        return _delete_drafts(args["client"], args["ids"])
     return {"error": f"Unknown tool: {name}"}
+
+
+# ── auto-seed legacy Iveresse on first boot ─────────────────────────────────
+
+def _seed_iveresse():
+    """One-time migration: if the store is empty but the old GR env vars exist,
+    create the 'iveresse' client so the existing setup keeps working."""
+    if not store.available():
+        return
+    try:
+        if store.count_clients() > 0:
+            return
+        gr_key = os.environ.get("GR_API_KEY", "")
+        if not gr_key:
+            return
+        store.create_client(
+            slug="iveresse", name="Iveresse", esp_type="getresponse",
+            credentials={"api_key": gr_key,
+                         "base": os.environ.get("GR_BASE", "https://api.getresponse.com/v3")},
+            defaults={"sender": os.environ.get("GR_DEFAULT_FROM_FIELD_ID", "rV7P7"),
+                      "audience": os.environ.get("GR_DEFAULT_CAMPAIGN_ID", "L9fb4")},
+        )
+        logger.info("Seeded 'iveresse' client from legacy GR env vars")
+    except Exception as e:
+        logger.error(f"Seed iveresse failed: {e}")
 
 
 # ── Starlette app ─────────────────────────────────────────────────────────────
 
 async def health(request):
-    return JSONResponse({"status": "ok", "server": "email-flow"})
+    return JSONResponse({"status": "ok", "server": "email-flow",
+                         "store": store.available(), "clients": store.count_clients()})
 
 
 async def dashboard(request):
-    gr_ok = "✅" if GR_API_KEY else "❌ GR_API_KEY not set"
+    clients = store.list_clients() if store.available() else []
+    rows = "".join(
+        f'<tr><td>{c["slug"]}</td><td>{c["name"]}</td><td>{c["esp_type"]}</td></tr>'
+        for c in clients)
+    store_ok = "✅" if store.available() else "❌ DATABASE_URL / MASTER_KEY missing"
     html = f"""<!DOCTYPE html><html><head><title>MCP Email Flow</title>
-    <style>body{{font-family:system-ui;max-width:600px;margin:60px auto;padding:0 20px;color:#1a1a1a}}
-    h1{{font-size:1.4rem;font-weight:600}}
-    .tag{{display:inline-block;padding:2px 10px;border-radius:20px;font-size:.85rem;background:#f0f0f0;margin:4px 0}}
-    </style></head><body>
-    <h1>MCP Email Flow</h1>
-    <p>Figma → GetResponse image pipeline for email newsletters.</p>
-    <p><b>GR API Key:</b> {gr_ok}</p>
-    <p><b>GR API base:</b> <code>{GR_BASE}</code></p>
-    <p><b>Default sender:</b> <code>{GR_DEFAULT_FROM_FIELD_ID}</code></p>
-    <p><b>Default list:</b> <code>{GR_DEFAULT_CAMPAIGN_ID}</code></p>
-    <p><b>MCP endpoint:</b> <code>/mcp</code></p>
-    <hr>
-    <p><b>Tools:</b></p>
-    {''.join(f'<span class="tag">{t.name}</span><br>' for t in ALL_TOOLS)}
+    <style>body{{font-family:system-ui;max-width:680px;margin:60px auto;padding:0 20px;color:#1a1a1a}}
+    h1{{font-size:1.4rem}} table{{border-collapse:collapse;width:100%;margin:12px 0}}
+    td,th{{text-align:left;padding:6px 10px;border-bottom:1px solid #eee;font-size:14px}}
+    .tag{{display:inline-block;padding:2px 10px;border-radius:20px;font-size:.8rem;background:#eef;margin:2px}}
+    a{{color:#2563eb}}</style></head><body>
+    <h1>MCP Email Flow — multi-client</h1>
+    <p>Figma → ESP (GetResponse / Klaviyo) draft pipeline.</p>
+    <p><b>Store:</b> {store_ok} · <b>Clients:</b> {len(clients)}</p>
+    <table><tr><th>slug</th><th>name</th><th>ESP</th></tr>{rows or '<tr><td colspan=3>none</td></tr>'}</table>
+    <p><a href="/admin">→ Admin panel</a> · <b>MCP:</b> <code>/mcp</code></p>
+    <p><b>Tools:</b> {''.join(f'<span class="tag">{t.name}</span>' for t in ALL_TOOLS)}</p>
     </body></html>"""
     return HTMLResponse(html)
 
 
-async def mcp_asgi(scope, receive, send):
-    await session_manager.handle_request(scope, receive, send)
-
-
 @contextlib.asynccontextmanager
 async def lifespan(app):
+    store.init_db()
+    _seed_iveresse()
     async with session_manager.run():
         yield
 
 
 _starlette_app = Starlette(
-    routes=[
-        Route("/",       endpoint=dashboard),
-        Route("/health", endpoint=health),
-    ],
+    routes=[Route("/", dashboard), Route("/health", health)] + admin.routes,
     lifespan=lifespan,
 )
-_starlette_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+_starlette_app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                              allow_methods=["*"], allow_headers=["*"])
 
 
 async def app(scope, receive, send):
-    """Top-level ASGI dispatcher: /mcp goes directly to session_manager
+    """Top-level ASGI dispatcher: /mcp goes straight to session_manager
     (avoids Starlette Mount trailing-slash redirect that drops POST bodies)."""
     if scope["type"] == "http" and scope.get("path", "").rstrip("/") == "/mcp":
         await session_manager.handle_request(scope, receive, send)
@@ -682,5 +391,5 @@ async def app(scope, receive, send):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"Starting MCP Email Flow on port {port}")
+    logger.info(f"Starting MCP Email Flow (multi-client) on port {port}")
     uvicorn.run("server:app", host="0.0.0.0", port=port)
