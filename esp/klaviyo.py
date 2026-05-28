@@ -150,9 +150,11 @@ class KlaviyoESP(BaseESP):
                         "attributes": {
                             "channel": "email",
                             "label": name,
+                            # preview_text omitted on purpose — it only renders for
+                            # drag-and-drop templates, and we use Custom HTML.
+                            # The preheader is injected as a hidden span in the HTML above.
                             "content": {
                                 "subject": subject,
-                                "preview_text": preheader or "",
                                 "from_email": sender,
                                 "from_label": from_label or sender,
                             },
