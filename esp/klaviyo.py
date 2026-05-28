@@ -118,6 +118,14 @@ class KlaviyoESP(BaseESP):
             return {"error": "No sender (from_email) — set it in Klaviyo Account "
                              "→ Settings → Contact Information or pass `sender` explicitly"}
 
+        # Klaviyo's `preview_text` field only works for drag-and-drop templates.
+        # For Custom HTML templates we must inject the preheader as a hidden span
+        # at the start of the HTML (same trick as GR).
+        if preheader:
+            span = (f'<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">'
+                    f'{preheader}</div>')
+            html = html.replace("<table", span + "<table", 1) if "<table" in html else span + html
+
         try:
             with httpx.Client(timeout=60) as c:
                 # 1. template
