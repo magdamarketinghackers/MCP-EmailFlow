@@ -27,6 +27,29 @@ Same Starlette + SSE stack as the other 8 MCP servers — see `mcp_architecture.
 - `delete_gr_drafts(newsletter_ids)` — bulk delete
 - `check_config` — diagnostic
 
+**GetResponse automation tools (GR connections only — error gracefully on Klaviyo):**
+Added 2026-06 to extend MCP-EmailFlow from "Figma→draft" into near-full email/automation
+marketing. All live against GR API v3, verified end-to-end.
+- `create_newsletter_draft(client, name, subject, [html], [plain], [campaign_id], [sender], [preheader])`
+  — editable draft; returns newsletterId.
+- `schedule_newsletter(client, send_on, [newsletter_id]|[inline content], [campaign_id], [segment_ids], ...)`
+  — schedules a **broadcast** for a future time. GR can't flip a draft to scheduled in-place,
+  so passing `newsletter_id` COPIES the draft's content into a new scheduled broadcast
+  (original draft stays). `send_on` = ISO 8601 w/ tz. Recipients: campaign_id and/or segment_ids.
+- `get_segments(client)` — saved searches (search-contacts) → {id, name}.
+- `create_segment(client, name, conditions, [campaign_ids], [condition_logic])`
+  — `conditions`=[{conditionType, operator, value, operatorType}]. tag-exists:
+  `{conditionType:"tag",operator:"exists",operatorType:"exists",value:"<tagId>"}`.
+  **campaignIdsList is required by GR** — auto-filled with ALL lists if campaign_ids omitted.
+- `upsert_contact(client, email, [campaign_id], [name], [tags], [custom_fields], [day_of_cycle])`
+  — tags=NAMES (find-or-create), custom_fields={name:value} (find-or-create as text).
+  Merges (doesn't wipe) existing tags/fields. Create returns 202 (async ~3s before findable).
+- `trigger_automation_event(client, email, [campaign_id], [add_tags], [set_custom_fields])`
+  — adds tags / sets fields on an EXISTING contact to fire GR Automation workflows.
+- `get_campaign_statistics(client, [newsletter_ids]|[campaign_ids], [group_by], [date_from], [date_to])`
+  — sent/delivered/opened/uniqueOpened/clicked/bounced/unsubscribed/complaints.
+  **GR requires at least one of newsletter_ids or campaign_ids** (no unfiltered query).
+
 ## Env vars (Railway)
 
 Required:

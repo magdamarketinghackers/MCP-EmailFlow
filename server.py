@@ -18,6 +18,7 @@ from mcp.types import Tool, TextContent
 import store
 import admin
 from esp import get_esp, SUPPORTED
+from esp.getresponse import GetResponseESP
 from esp.images import fetch_and_prepare
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -85,8 +86,25 @@ WORKFLOW
 ══════════════════════════════════════════════════════════════════════════
 TOOLS (all except list_clients take `client`)
 ══════════════════════════════════════════════════════════════════════════
+Figma → draft flow (any ESP):
 • list_clients · bulk_upload_urls · create_draft
 • list_senders · list_audiences · list_drafts · delete_drafts
+
+GetResponse automation (GR connections only):
+• create_newsletter_draft — draft with HTML/plain + campaign_id
+• schedule_newsletter — schedule a broadcast for a future time (sendOn);
+  from an existing draft (newsletter_id) or inline; to lists and/or segments
+• get_segments / create_segment — saved searches (search-contacts);
+  conditions like tag-exists, email-not-contains, etc.
+• upsert_contact — add/update a contact (tags by name, custom fields by name)
+• trigger_automation_event — add tags / set custom fields on a contact to
+  fire GR Automation workflows
+• get_campaign_statistics — opens, clicks, unsubscribes, bounces per newsletter
+
+GR automation playbook:
+  upsert_contact → (optional) create_segment → create_newsletter_draft →
+  schedule_newsletter → get_campaign_statistics. Tags/fields set via
+  trigger_automation_event drive GR Automation flows.
 """
 
 server = Server("email-flow", instructions=SERVER_INSTRUCTIONS)
@@ -114,6 +132,18 @@ def _resolve(slug: str, connection: Optional[str] = None):
         return get_esp(conn), {"client": slug, "connection": conn["label"]}, None
     except Exception as e:
         return None, None, {"error": f"Failed to init ESP for '{slug}/{conn['label']}': {e}"}
+
+
+def _resolve_gr(slug: str, connection: Optional[str] = None):
+    """Like _resolve but requires a GetResponse connection (automation tools
+    are GR-specific). Returns (gr_esp, info, None) or (None, None, error)."""
+    esp, info, err = _resolve(slug, connection)
+    if err:
+        return None, None, err
+    if not isinstance(esp, GetResponseESP):
+        return None, None, {"error": f"This tool is GetResponse-only; "
+                                      f"'{slug}/{info['connection']}' is not a GetResponse connection."}
+    return esp, info, None
 
 
 # ── tool implementations ──────────────────────────────────────────────────────
@@ -216,6 +246,77 @@ def _delete_drafts(client: str, ids: List[str],
         return {"error": str(e)}
 
 
+# ── GetResponse automation tools (GR-only) ──────────────────────────────────
+
+def _gr_call(client, connection, fn):
+    esp, _info, err = _resolve_gr(client, connection)
+    if err:
+        return err
+    try:
+        return fn(esp)
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def _create_newsletter_draft(client, name, subject, html=None, plain="",
+                             campaign_id=None, sender=None, preheader=None,
+                             connection=None) -> Dict:
+    if not (subject and 2 <= len(subject) <= 128):
+        return {"error": "subject must be 2-128 chars"}
+    if not (name and 2 <= len(name) <= 128):
+        return {"error": "name must be 2-128 chars"}
+    if not ((html and html.strip()) or (plain and plain.strip())):
+        return {"error": "provide html and/or plain body"}
+    return _gr_call(client, connection, lambda e: e.create_newsletter_draft(
+        name, subject, html or "", plain=plain or "", campaign_id=campaign_id,
+        sender=sender, preheader=preheader))
+
+
+def _schedule_newsletter(client, send_on, newsletter_id=None, name=None, subject=None,
+                         html=None, plain="", campaign_id=None, sender=None,
+                         preheader=None, segment_ids=None, connection=None) -> Dict:
+    return _gr_call(client, connection, lambda e: e.schedule_newsletter(
+        send_on, newsletter_id=newsletter_id, name=name, subject=subject,
+        html=html, plain=plain or "", campaign_id=campaign_id, sender=sender,
+        preheader=preheader, segment_ids=segment_ids))
+
+
+def _get_segments(client, connection=None) -> Dict:
+    return _gr_call(client, connection, lambda e: e.get_segments())
+
+
+def _create_segment(client, name, conditions, campaign_ids=None, subscribers_type=None,
+                    condition_logic="and", section_logic="or",
+                    subscriber_cycle=None, subscription_date="all_time",
+                    connection=None) -> Dict:
+    return _gr_call(client, connection, lambda e: e.create_segment(
+        name, conditions, campaign_ids=campaign_ids, subscribers_type=subscribers_type,
+        condition_logic=condition_logic, section_logic=section_logic,
+        subscriber_cycle=subscriber_cycle, subscription_date=subscription_date))
+
+
+def _upsert_contact(client, email, campaign_id=None, name=None, tags=None,
+                    custom_fields=None, day_of_cycle=None, connection=None) -> Dict:
+    return _gr_call(client, connection, lambda e: e.upsert_contact(
+        email, campaign_id=campaign_id, name=name, tags=tags,
+        custom_fields=custom_fields, day_of_cycle=day_of_cycle))
+
+
+def _trigger_automation_event(client, email, campaign_id=None, add_tags=None,
+                              set_custom_fields=None, connection=None) -> Dict:
+    return _gr_call(client, connection, lambda e: e.trigger_automation_event(
+        email, campaign_id=campaign_id, add_tags=add_tags,
+        set_custom_fields=set_custom_fields))
+
+
+def _get_campaign_statistics(client, newsletter_ids=None, campaign_ids=None,
+                             group_by="total", date_from=None, date_to=None,
+                             connection=None) -> Dict:
+    return _gr_call(client, connection, lambda e: e.get_campaign_statistics(
+        newsletter_ids=newsletter_ids, campaign_ids=campaign_ids, group_by=group_by,
+        date_from=date_from, date_to=date_to))
+
+
 # ── MCP tool registry ─────────────────────────────────────────────────────────
 
 _CLIENT_PROP = {"type": "string", "description": "Client slug (from list_clients), e.g. 'iveresse'"}
@@ -309,6 +410,156 @@ ALL_TOOLS = [
             "required": ["client", "ids"],
         },
     ),
+
+    # ── GetResponse automation / marketing (GR connections only) ────────────
+    Tool(
+        name="create_newsletter_draft",
+        description=("GetResponse only. Create an editable newsletter DRAFT with HTML "
+                     "and/or plain body, assigned to a list (campaign_id). Returns "
+                     "newsletterId for later scheduling. Use create_draft instead if "
+                     "you came from the Figma flow."),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP, "connection": _CONN_PROP,
+                "name": {"type": "string", "description": "Internal draft name (2-128 chars)"},
+                "subject": {"type": "string", "description": "Inbox subject (2-128 chars)"},
+                "html": {"type": "string", "description": "HTML body (optional if plain given)"},
+                "plain": {"type": "string", "description": "Plain-text body (optional)"},
+                "campaign_id": {"type": "string", "description": "List/campaign ID. Defaults to client config."},
+                "sender": {"type": "string", "description": "fromFieldId. Defaults to client config."},
+                "preheader": {"type": "string", "description": "Preview text (recommended)"},
+            },
+            "required": ["client", "name", "subject"],
+        },
+    ),
+    Tool(
+        name="schedule_newsletter",
+        description=("GetResponse only. Schedule a broadcast for a future time (send_on, "
+                     "ISO 8601 with timezone). Either pass an existing draft's newsletter_id "
+                     "(its content is copied into the scheduled broadcast) OR pass content "
+                     "inline. Recipients via campaign_id and/or segment_ids (saved searches)."),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP, "connection": _CONN_PROP,
+                "send_on": {"type": "string", "description": "ISO 8601, e.g. 2026-06-20T09:00:00+0200"},
+                "newsletter_id": {"type": "string", "description": "Draft to schedule (copies its content)"},
+                "name": {"type": "string", "description": "Override broadcast name"},
+                "subject": {"type": "string", "description": "Override subject"},
+                "html": {"type": "string", "description": "Inline HTML (if not using a draft)"},
+                "plain": {"type": "string", "description": "Inline plain body"},
+                "campaign_id": {"type": "string", "description": "Recipient list ID"},
+                "segment_ids": {"type": "array", "items": {"type": "string"},
+                                "description": "Recipient segment IDs (from get_segments)"},
+                "sender": {"type": "string", "description": "fromFieldId override"},
+                "preheader": {"type": "string", "description": "Preview text"},
+            },
+            "required": ["client", "send_on"],
+        },
+    ),
+    Tool(
+        name="get_segments",
+        description="GetResponse only. List saved segments (search-contacts) with IDs for use in schedule_newsletter.",
+        inputSchema={"type": "object",
+                     "properties": {"client": _CLIENT_PROP, "connection": _CONN_PROP},
+                     "required": ["client"]},
+    ),
+    Tool(
+        name="create_segment",
+        description=("GetResponse only. Create a saved segment (POST /v3/search-contacts). "
+                     "conditions is a list of {conditionType, operator, value, operatorType}. "
+                     "Examples: tag exists → {\"conditionType\":\"tag\",\"operator\":\"exists\","
+                     "\"operatorType\":\"exists\",\"value\":\"<tagId>\"}; email not_contains → "
+                     "{\"conditionType\":\"email\",\"operator\":\"not_contains\","
+                     "\"operatorType\":\"string_operator\",\"value\":\"@x.com\"}. "
+                     "condition_logic combines conditions (and/or)."),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP, "connection": _CONN_PROP,
+                "name": {"type": "string", "description": "Segment name (1-128 chars)"},
+                "conditions": {
+                    "type": "array",
+                    "description": "Condition objects",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "conditionType": {"type": "string", "description": "e.g. tag, email, name, geo"},
+                            "operator": {"type": "string", "description": "e.g. exists, is, is_not, contains, not_contains"},
+                            "operatorType": {"type": "string", "description": "e.g. exists, string_operator"},
+                            "value": {"description": "Value (e.g. tagId or string). Omit for exists."},
+                        },
+                        "required": ["conditionType", "operator"],
+                    },
+                },
+                "campaign_ids": {"type": "array", "items": {"type": "string"},
+                                 "description": "Limit to these list IDs (optional)"},
+                "condition_logic": {"type": "string", "description": "'and' (default) or 'or'"},
+                "subscribers_type": {"type": "array", "items": {"type": "string"},
+                                     "description": "Default ['subscribed']"},
+            },
+            "required": ["client", "name", "conditions"],
+        },
+    ),
+    Tool(
+        name="upsert_contact",
+        description=("GetResponse only. Add or update a contact by email within a list. "
+                     "tags = list of tag NAMES (created if missing). custom_fields = "
+                     "{fieldName: value} (created as text if missing). Existing tags/fields "
+                     "are merged, not wiped."),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP, "connection": _CONN_PROP,
+                "email": {"type": "string"},
+                "campaign_id": {"type": "string", "description": "List ID. Defaults to client config."},
+                "name": {"type": "string", "description": "Contact full name (optional)"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Tag names"},
+                "custom_fields": {"type": "object", "description": "{fieldName: value}"},
+                "day_of_cycle": {"type": "string", "description": "Autoresponder day (optional)"},
+            },
+            "required": ["client", "email"],
+        },
+    ),
+    Tool(
+        name="trigger_automation_event",
+        description=("GetResponse only. Fire GR Automation triggers on an existing contact "
+                     "(by email) by adding tags and/or changing custom fields. Use this to "
+                     "kick off automation workflows that listen for a tag/field change."),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP, "connection": _CONN_PROP,
+                "email": {"type": "string"},
+                "campaign_id": {"type": "string", "description": "Narrow lookup to a list (optional)"},
+                "add_tags": {"type": "array", "items": {"type": "string"},
+                             "description": "Tag names to add (created if missing)"},
+                "set_custom_fields": {"type": "object", "description": "{fieldName: value} to set"},
+            },
+            "required": ["client", "email"],
+        },
+    ),
+    Tool(
+        name="get_campaign_statistics",
+        description=("GetResponse only. Delivery stats for newsletters: sent, delivered, "
+                     "opened, clicked, bounced, unsubscribed, complaints. Filter by "
+                     "newsletter_ids and date range; group_by total|hour|day|month."),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "client": _CLIENT_PROP, "connection": _CONN_PROP,
+                "newsletter_ids": {"type": "array", "items": {"type": "string"},
+                                   "description": "Filter to these newsletter IDs (specific sends)"},
+                "campaign_ids": {"type": "array", "items": {"type": "string"},
+                                 "description": "Filter to all sends to these list IDs. Provide newsletter_ids OR campaign_ids."},
+                "group_by": {"type": "string", "description": "total (default) | hour | day | month"},
+                "date_from": {"type": "string", "description": "ISO date lower bound (createdOn)"},
+                "date_to": {"type": "string", "description": "ISO date upper bound (createdOn)"},
+            },
+            "required": ["client"],
+        },
+    ),
 ]
 
 
@@ -344,6 +595,48 @@ def _dispatch(name: str, args: dict) -> Dict[str, Any]:
                             connection=args.get("connection"))
     if name == "delete_drafts":
         return _delete_drafts(args["client"], args["ids"], connection=args.get("connection"))
+    # GetResponse automation tools
+    if name == "create_newsletter_draft":
+        return _create_newsletter_draft(
+            args["client"], args["name"], args["subject"], html=args.get("html"),
+            plain=args.get("plain", ""), campaign_id=args.get("campaign_id"),
+            sender=args.get("sender"), preheader=args.get("preheader"),
+            connection=args.get("connection"))
+    if name == "schedule_newsletter":
+        return _schedule_newsletter(
+            args["client"], args["send_on"], newsletter_id=args.get("newsletter_id"),
+            name=args.get("name"), subject=args.get("subject"), html=args.get("html"),
+            plain=args.get("plain", ""), campaign_id=args.get("campaign_id"),
+            sender=args.get("sender"), preheader=args.get("preheader"),
+            segment_ids=args.get("segment_ids"), connection=args.get("connection"))
+    if name == "get_segments":
+        return _get_segments(args["client"], connection=args.get("connection"))
+    if name == "create_segment":
+        return _create_segment(
+            args["client"], args["name"], args["conditions"],
+            campaign_ids=args.get("campaign_ids"), subscribers_type=args.get("subscribers_type"),
+            condition_logic=args.get("condition_logic", "and"),
+            section_logic=args.get("section_logic", "or"),
+            subscriber_cycle=args.get("subscriber_cycle"),
+            subscription_date=args.get("subscription_date", "all_time"),
+            connection=args.get("connection"))
+    if name == "upsert_contact":
+        return _upsert_contact(
+            args["client"], args["email"], campaign_id=args.get("campaign_id"),
+            name=args.get("name"), tags=args.get("tags"),
+            custom_fields=args.get("custom_fields"), day_of_cycle=args.get("day_of_cycle"),
+            connection=args.get("connection"))
+    if name == "trigger_automation_event":
+        return _trigger_automation_event(
+            args["client"], args["email"], campaign_id=args.get("campaign_id"),
+            add_tags=args.get("add_tags"), set_custom_fields=args.get("set_custom_fields"),
+            connection=args.get("connection"))
+    if name == "get_campaign_statistics":
+        return _get_campaign_statistics(
+            args["client"], newsletter_ids=args.get("newsletter_ids"),
+            campaign_ids=args.get("campaign_ids"),
+            group_by=args.get("group_by", "total"), date_from=args.get("date_from"),
+            date_to=args.get("date_to"), connection=args.get("connection"))
     return {"error": f"Unknown tool: {name}"}
 
 
